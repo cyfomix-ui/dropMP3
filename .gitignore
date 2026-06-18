@@ -49,6 +49,5 @@ Doc/**/*.mp4
 Doc/**/*.wav
 Doc/**/*.m4a
 
-'@ | Set-Content .gitignore -Encoding UTF8
 # Document samples - do not commit bundled media samples
 Doc/Sample/
