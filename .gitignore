@@ -1,0 +1,54 @@
+@'
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+*.exe
+*.spec
+
+# Backups / packages
+OldSource/
+oldsource/
+backup/
+*.zip
+
+# Work logs
+_WorkHistory/
+_Worker/
+
+# Local config / user data
+_conf/
+*.m3u8
+
+# VSCode Counter
+.VSCodeCounter/
+
+# Logs / temp
+*.log
+*.tmp
+*.bak
+
+# Secrets
+.env
+*.key
+*.pem
+cookies*.txt
+token*.json
+secret*.json
+
+# Documents - exclude large distribution/sample files
+Doc/**/*.zip
+Doc/**/*.exe
+Doc/**/*.mp3
+Doc/**/*.mp4
+Doc/**/*.wav
+Doc/**/*.m4a
+
+'@ | Set-Content .gitignore -Encoding UTF8
+# Document samples - do not commit bundled media samples
+Doc/Sample/
