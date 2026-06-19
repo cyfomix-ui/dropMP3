@@ -51,3 +51,8 @@ Doc/**/*.m4a
 
 # Document samples - do not commit bundled media samples
 Doc/Sample/
+
+# Local/private documents
+Doc/AIで簡単に作る自分専用のアプリ_DropMp3(1).md
+
+Doc/DropMP3_note_公開用.md
