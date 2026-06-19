@@ -113,10 +113,19 @@ pyinstaller_assets/     Splash 画像などのビルド用素材
 - `_conf\lst` : 保存済みプレイリスト
 - `_conf\srt` : 生成済み字幕
 
+### ライセンス
+
+- ソースコードは [MIT License](./LICENSE) です。
+- 自由に利用、改変、再配布できます。
+- ソフトウェアは無保証で提供されます。
+- 利用による不具合、損害、データ損失、その他の問題について作者は責任を負いません。
+- ただし、アプリ名、ロゴ、アイコン、スプラッシュ画像、スクリーンショット、画面素材などは MIT License の対象外です。
+- 改変版を配布する場合は、`DropMP3` の名称やオリジナル素材を許可なく使わないでください。
+- 詳細は [LICENSE](./LICENSE) と [ASSETS_LICENSE.md](./ASSETS_LICENSE.md) を参照してください。
+
 ### 公開時の補足
 
 - 現状は Windows デスクトップ利用を前提にしています。
-- リポジトリ公開時は、必要に応じて `LICENSE` を追加してください。
 - `dist/` や `_conf/` の個人データは `.gitignore` 対象です。公開前に内容を確認してください。
 
 ## English
@@ -230,8 +239,17 @@ Main `_conf` contents:
 - `_conf\lst` : saved playlists
 - `_conf\srt` : generated subtitles
 
+### License
+
+- The source code is licensed under the [MIT License](./LICENSE).
+- You are free to use, modify, and redistribute it.
+- The software is provided as-is, without warranty.
+- The author is not responsible for damage, data loss, malfunction, or other issues caused by using this software.
+- The application name, logo, icons, splash images, screenshots, and visual assets are not covered by the MIT License.
+- Modified versions must not use the `DropMP3` name or original visual assets without permission.
+- See [LICENSE](./LICENSE) and [ASSETS_LICENSE.md](./ASSETS_LICENSE.md) for details.
+
 ### Notes for Public Release
 
 - The current project targets Windows desktop use.
-- Add a `LICENSE` file before publishing if needed.
 - `dist/` and personal data under `_conf/` are ignored by `.gitignore`; review them before release.
