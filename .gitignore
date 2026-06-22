@@ -20,6 +20,8 @@ backup/
 # Work logs
 _WorkHistory/
 _Worker/
+_WorkerArchive/
+AGENTS.md
 
 # Local config / user data
 _conf/

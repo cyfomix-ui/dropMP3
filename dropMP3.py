@@ -3,6 +3,7 @@ import os
 import json
 import time
 import random
+import math
 import re
 import mimetypes
 import shutil
@@ -25,6 +26,7 @@ from PySide6.QtCore import (
     QObject,
     Signal,
     QPoint,
+    QPointF,
     QSize,
     QRect,
     QEvent,
@@ -40,8 +42,11 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QIcon,
+    QKeySequence,
+    QPen,
     QDrag,
     QDesktopServices,
+    QShortcut,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -1355,8 +1360,91 @@ class DropOneShotButton(QPushButton):
         super().dropEvent(event)
 
 
+class SeekStepButton(QPushButton):
+    def __init__(self, direction: int, seconds: int, parent=None):
+        super().__init__(parent)
+        self.direction = -1 if direction < 0 else 1
+        self.seconds = max(1, int(seconds))
+        self.base_size = 63
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.setFixedSize(self.base_size, self.base_size)
+        self.setStyleSheet("background:transparent;border:0;")
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        if not self.isEnabled():
+            fill = QColor("#222222")
+            border = QColor("#4a4a4a")
+            accent = QColor("#9a9a9a")
+        elif self.isDown():
+            fill = QColor("#353535")
+            border = QColor("#ffb36a")
+            accent = QColor("#ffd2a1")
+        elif self.underMouse():
+            fill = QColor("#313131")
+            border = QColor("#ff9b45")
+            accent = QColor("#ffc283")
+        else:
+            fill = QColor("#2b2b2b")
+            border = QColor("#555555")
+            accent = QColor("#ffb36a")
+
+        outer = self.rect().adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(border, 1.2))
+        painter.setBrush(fill)
+        painter.drawEllipse(outer)
+
+        scale = min(self.width(), self.height()) / float(self.base_size or 63)
+        pad = max(6, int(round(9 * scale)))
+        arc_rect = outer.adjusted(pad, pad, -pad, -pad)
+        pen = QPen(accent, max(2.0, 3.0 * scale), Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+        painter.setPen(pen)
+        if self.direction < 0:
+            start_angle = 36
+            span_angle = 285
+        else:
+            start_angle = 144
+            span_angle = -285
+        painter.drawArc(arc_rect, start_angle * 16, span_angle * 16)
+
+        end_angle = start_angle + span_angle
+        center = arc_rect.center()
+        radius = arc_rect.width() / 2.0
+        end_rad = math.radians(-end_angle)
+        tip = QPointF(
+            center.x() + radius * math.cos(end_rad),
+            center.y() + radius * math.sin(end_rad),
+        )
+        tangent_rad = end_rad + (math.pi / 2.0 if span_angle > 0 else -math.pi / 2.0)
+        wing = max(5.0, 7.0 * scale)
+        arrow_a = QPointF(
+            tip.x() - wing * math.cos(tangent_rad - 0.55),
+            tip.y() - wing * math.sin(tangent_rad - 0.55),
+        )
+        arrow_b = QPointF(
+            tip.x() - wing * math.cos(tangent_rad + 0.55),
+            tip.y() - wing * math.sin(tangent_rad + 0.55),
+        )
+        painter.drawLine(tip, arrow_a)
+        painter.drawLine(tip, arrow_b)
+
+        text_font = QFont(self.font())
+        text_font.setBold(True)
+        text_font.setPointSize(max(10, int(round(15 * scale))))
+        painter.setFont(text_font)
+        painter.setPen(accent)
+        text_top = int(round(6 * scale))
+        text_bottom = int(round(2 * scale))
+        painter.drawText(self.rect().adjusted(0, text_top, 0, text_bottom), Qt.AlignCenter, str(self.seconds))
+
+
 class MiniDropPlayer(QWidget):
     WIDE_PLAYLIST_THRESHOLD = 860
+    SEEK_STEP_MS = 10000
 
     def __init__(self, splash: StartupSplash | None = None):
         super().__init__()
@@ -1392,6 +1480,7 @@ class MiniDropPlayer(QWidget):
         self.update_startup_splash("アイコンを読み込み中...", 12)
         self.apply_app_icon()
         self.setAcceptDrops(True)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.resize(720, 520)
         self.setMinimumSize(280, 260)
 
@@ -1435,8 +1524,10 @@ class MiniDropPlayer(QWidget):
         self.playlist_font_size = 12
         self.volume_font_size = 12
         self.title_font_size = 28
+        self.control_icon_scale = 1.0
         self.playlist_order_mode = ""
         self.playlist_search_text = ""
+        self.current_playlist_name = self.generate_new_playlist_name()
         self.property_dialogs = []
         self.whisper_dialogs = []
         self.help_dialogs = []
@@ -1475,6 +1566,7 @@ class MiniDropPlayer(QWidget):
         self.build_ui()
         self.update_startup_splash("操作を接続中...", 58)
         self.connect_signals()
+        self.setup_media_shortcuts()
         self.update_startup_splash("タスクトレイを準備中...", 66)
         self.setup_tray_icon()
         self.update_startup_splash("設定とプレイリストを復元中...", 72)
@@ -1735,6 +1827,17 @@ class MiniDropPlayer(QWidget):
             }
             QPushButton:hover { background-color:#253245; border-color:#66a8ff; color:#ffffff; }
         """)
+        self.new_playlist_button = QPushButton("+")
+        self.new_playlist_button.setToolTip(T("新しい再生リストを作成"))
+        self.new_playlist_button.setFixedSize(42, 42)
+        self.new_playlist_button.setStyleSheet("""
+            QPushButton {
+                background-color:#2b2b2b; color:#f3f7ff; border:1px solid #666;
+                border-radius:21px; font-size:28px; min-width:42px; min-height:42px;
+                font-family:'Arial Black','Yu Gothic UI Semibold','Meiryo UI'; font-weight:900;
+            }
+            QPushButton:hover { background-color:#253245; border-color:#66a8ff; color:#ffffff; }
+        """)
         self.subtitle_toggle_button = QPushButton("💬")
         self.subtitle_toggle_button.setToolTip(T("字幕表示を切り替えます"))
         self.subtitle_toggle_button.setFixedSize(42, 42)
@@ -1743,6 +1846,7 @@ class MiniDropPlayer(QWidget):
         header_layout.addWidget(self.load_playlist_button, alignment=Qt.AlignLeft | Qt.AlignVCenter)
         header_layout.addWidget(self.clear_playlist_button, alignment=Qt.AlignLeft | Qt.AlignVCenter)
         header_layout.addWidget(self.save_playlist_button, alignment=Qt.AlignLeft | Qt.AlignVCenter)
+        header_layout.addWidget(self.new_playlist_button, alignment=Qt.AlignLeft | Qt.AlignVCenter)
         header_layout.addSpacing(4)
         header_layout.addWidget(self.title_label, stretch=1)
         header_layout.addWidget(self.subtitle_toggle_button, alignment=Qt.AlignRight | Qt.AlignVCenter)
@@ -1869,7 +1973,9 @@ class MiniDropPlayer(QWidget):
         self.left_panel.hide()
 
         self.prev_button = QPushButton("⏮")
+        self.seek_back_button = SeekStepButton(-1, 10)
         self.play_button = QPushButton("▶")
+        self.seek_forward_button = SeekStepButton(1, 10)
         self.next_button = QPushButton("⏭")
         for b in (self.prev_button, self.play_button, self.next_button):
             b.setFixedSize(63, 63)
@@ -1880,8 +1986,13 @@ class MiniDropPlayer(QWidget):
                 }
                 QPushButton:hover { background-color: #3a3a3a; }
             """)
+            b.setFocusPolicy(Qt.NoFocus)
+        for b in (self.seek_back_button, self.seek_forward_button):
+            b.setFixedSize(63, 63)
         self.prev_button.setToolTip(T("前の曲へ戻ります"))
+        self.seek_back_button.setToolTip(T("10秒戻ります"))
         self.play_button.setToolTip(T("再生 / 一時停止を切り替えます"))
+        self.seek_forward_button.setToolTip(T("10秒進みます"))
         self.next_button.setToolTip(T("次の曲へ進みます"))
         self.one_shot_button = DropOneShotButton("🎯")
         self.one_shot_button.configure_drop_expand(QSize(42, 42), QSize(96, 60), expanded_text="DROP\n🎯")
@@ -1972,7 +2083,9 @@ class MiniDropPlayer(QWidget):
         control_layout.addWidget(self.volume_label, alignment=Qt.AlignLeft | Qt.AlignVCenter)
         control_layout.addStretch(1)
         control_layout.addWidget(self.prev_button)
+        control_layout.addWidget(self.seek_back_button)
         control_layout.addWidget(self.play_button)
+        control_layout.addWidget(self.seek_forward_button)
         control_layout.addWidget(self.next_button)
         control_layout.addStretch(1)
         control_layout.addWidget(self.subtitle_font_button)
@@ -1987,17 +2100,45 @@ class MiniDropPlayer(QWidget):
         self.small_play_button = QPushButton("▶")
         self.small_play_button.setToolTip(T("再生 / 一時停止を切り替えます"))
         self.small_play_button.setFixedSize(38, 38)
+        self.small_play_button.setFocusPolicy(Qt.NoFocus)
         self.small_play_button.hide()
+        self.small_seek_back_button = SeekStepButton(-1, 10)
+        self.small_seek_back_button.setToolTip(T("10秒戻ります"))
+        self.small_seek_back_button.setFixedSize(30, 30)
+        self.small_seek_back_button.hide()
+        self.small_seek_forward_button = SeekStepButton(1, 10)
+        self.small_seek_forward_button.setToolTip(T("10秒進みます"))
+        self.small_seek_forward_button.setFixedSize(30, 30)
+        self.small_seek_forward_button.hide()
         self.small_next_button = QPushButton("⏭")
         self.small_next_button.setToolTip(T("次の曲へ進みます"))
         self.small_next_button.setFixedSize(38, 38)
+        self.small_next_button.setFocusPolicy(Qt.NoFocus)
         self.small_next_button.hide()
+
+        self.control_icon_widgets = [
+            self.prev_button,
+            self.seek_back_button,
+            self.play_button,
+            self.seek_forward_button,
+            self.next_button,
+            self.small_seek_back_button,
+            self.small_play_button,
+            self.small_seek_forward_button,
+            self.small_next_button,
+        ]
+        for widget in self.control_icon_widgets:
+            widget.installEventFilter(self)
+            widget.setToolTip((widget.toolTip() + "\n" if widget.toolTip() else "") + "Ctrl+ホイール: 操作アイコン拡大縮小")
+        self.apply_control_icon_scale()
 
         self.small_control_layout = QHBoxLayout()
         self.small_control_layout.setContentsMargins(0, 0, 8, 8)
         self.small_control_layout.setSpacing(6)
         self.small_control_layout.addWidget(self.small_time_label, stretch=1)
+        self.small_control_layout.addWidget(self.small_seek_back_button)
         self.small_control_layout.addWidget(self.small_play_button)
+        self.small_control_layout.addWidget(self.small_seek_forward_button)
         self.small_control_layout.addWidget(self.small_next_button)
         self.small_control_layout.addWidget(self.small_subtitle_font_button)
         self.small_control_layout.addWidget(self.small_one_shot_button)
@@ -2078,19 +2219,23 @@ class MiniDropPlayer(QWidget):
         self.setLayout(self.root_layout)
 
         self.normal_control_widgets = [
-            self.header_widget, self.prev_button, self.play_button, self.next_button,
+            self.header_widget, self.prev_button, self.seek_back_button, self.play_button, self.seek_forward_button, self.next_button,
             self.subtitle_font_button, self.one_shot_button, self.gear_button, self.volume_label,
             self.help_button,
             self.current_time_label, self.total_time_label, self.position_slider,
         ]
         self.one_shot_widgets = [self.one_shot_header_label, self.one_shot_name_label]
-        self.small_widgets = [self.small_time_label, self.small_play_button, self.small_next_button, self.small_subtitle_font_button, self.small_one_shot_button, self.art_title_label]
+        self.small_widgets = [self.small_time_label, self.small_seek_back_button, self.small_play_button, self.small_seek_forward_button, self.small_next_button, self.small_subtitle_font_button, self.small_one_shot_button, self.art_title_label]
 
     def connect_signals(self):
         app_log("Connect signals")
         self.play_button.clicked.connect(self.toggle_play)
         self.small_play_button.clicked.connect(self.toggle_play)
         self.prev_button.clicked.connect(self.play_prev)
+        self.seek_back_button.clicked.connect(self.seek_backward_10s)
+        self.small_seek_back_button.clicked.connect(self.seek_backward_10s)
+        self.seek_forward_button.clicked.connect(self.seek_forward_10s)
+        self.small_seek_forward_button.clicked.connect(self.seek_forward_10s)
         self.next_button.clicked.connect(lambda: self.play_next())
         self.small_next_button.clicked.connect(lambda: self.play_next())
         self.gear_button.clicked.connect(self.show_gear_menu)
@@ -2109,6 +2254,7 @@ class MiniDropPlayer(QWidget):
         self.load_playlist_button.clicked.connect(self.show_saved_playlist_popup)
         self.clear_playlist_button.clicked.connect(self.confirm_clear_playlist)
         self.save_playlist_button.clicked.connect(self.export_playlist_file_dialog)
+        self.new_playlist_button.clicked.connect(self.create_new_playlist)
         self.close_drawer_button.clicked.connect(self.close_playlist_drawer)
         self.left_list.deletePressed.connect(self.delete_selected_from_left_playlist)
         self.left_list.orderChanged.connect(self.apply_left_playlist_order)
@@ -2139,6 +2285,44 @@ class MiniDropPlayer(QWidget):
         self.position_slider.sliderPressed.connect(self.on_seek_start)
         self.position_slider.sliderReleased.connect(self.on_seek_end)
         self.position_slider.sliderMoved.connect(self.on_seek_move)
+
+    def setup_media_shortcuts(self):
+        self.media_shortcuts = []
+        shortcut_specs = [
+            (QKeySequence(Qt.Key_Space), self.handle_toggle_play_shortcut),
+            (QKeySequence(Qt.Key_Right), self.handle_seek_forward_shortcut),
+            (QKeySequence(Qt.Key_Left), self.handle_seek_backward_shortcut),
+        ]
+        for sequence, handler in shortcut_specs:
+            shortcut = QShortcut(sequence, self)
+            shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+            shortcut.activated.connect(handler)
+            self.media_shortcuts.append(shortcut)
+
+    def is_media_shortcut_blocked(self) -> bool:
+        widget = QApplication.focusWidget()
+        if widget is None:
+            return False
+        blocked_types = (QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QListWidget, QTreeWidget)
+        if isinstance(widget, blocked_types):
+            return True
+        blocked_names = ("QLineEdit", "QAbstractSpinBox", "QAbstractItemView", "QMenu")
+        return any(widget.inherits(name) for name in blocked_names)
+
+    def handle_toggle_play_shortcut(self):
+        if self.is_media_shortcut_blocked():
+            return
+        self.toggle_play()
+
+    def handle_seek_backward_shortcut(self):
+        if self.is_media_shortcut_blocked():
+            return
+        self.seek_backward_10s()
+
+    def handle_seek_forward_shortcut(self):
+        if self.is_media_shortcut_blocked():
+            return
+        self.seek_forward_10s()
 
     def play_dropped_one_shot(self, dropped: list[Path]):
         files = self.normalize_dropped_files(dropped)
@@ -2355,6 +2539,29 @@ class MiniDropPlayer(QWidget):
                 self.play_index(0, autoplay=True)
             else:
                 self.player.play()
+
+    def seek_relative(self, delta_ms: int):
+        source = self.player.source()
+        if source.isEmpty() and self.current_index < 0 and self.one_shot_path is None:
+            return
+        duration = max(0, self.player.duration())
+        current = self.position_slider.value() if self.user_is_seeking else self.player.position()
+        target = max(0, current + delta_ms)
+        if duration > 0:
+            target = min(target, duration)
+        app_log(f"Seek relative: {delta_ms} ms -> {target} ms")
+        self.player.setPosition(target)
+        if self.user_is_seeking:
+            self.position_slider.setValue(target)
+        self.current_time_label.setText(format_ms(target))
+        self.update_small_time_label(target, duration)
+        self.save_settings()
+
+    def seek_backward_10s(self):
+        self.seek_relative(-self.SEEK_STEP_MS)
+
+    def seek_forward_10s(self):
+        self.seek_relative(self.SEEK_STEP_MS)
 
     def play_prev(self):
         if not self.playlist:
@@ -3139,6 +3346,85 @@ class MiniDropPlayer(QWidget):
         app_log(f"Title font size changed by wheel: {self.title_font_size}px")
         self.save_settings()
 
+    def apply_control_icon_scale(self):
+        scale = max(0.7, min(2.5, float(self.control_icon_scale)))
+        self.control_icon_scale = scale
+
+        prev_next_size = max(40, int(round(63 * scale)))
+        prev_next_radius = prev_next_size // 2
+        prev_next_font = max(20, int(round(30 * scale)))
+        seek_size = max(32, int(round(63 * 0.7 * scale)))
+        play_size = max(54, int(round(63 * 1.5 * scale)))
+        play_radius = play_size // 2
+        play_font = max(26, int(round(30 * 1.5 * scale)))
+        small_seek_size = max(18, int(round(30 * scale)))
+        small_play_size = max(30, int(round(38 * 1.5 * scale)))
+        small_next_size = max(24, int(round(38 * scale)))
+
+        button_style = (
+            "QPushButton {"
+            "background-color:#2b2b2b; color:white; border:1px solid #555;"
+            f"border-radius:{prev_next_radius}px; font-size:{prev_next_font}px;"
+            f"min-width:{prev_next_size}px; min-height:{prev_next_size}px;"
+            "}"
+            "QPushButton:hover { background-color:#3a3a3a; }"
+        )
+        play_style = (
+            "QPushButton {"
+            "background-color:#2b2b2b; color:white; border:1px solid #555;"
+            f"border-radius:{play_radius}px; font-size:{play_font}px;"
+            f"min-width:{play_size}px; min-height:{play_size}px;"
+            "}"
+            "QPushButton:hover { background-color:#3a3a3a; }"
+        )
+        small_button_style = (
+            "QPushButton {"
+            "background-color: rgba(20,20,20,190); color:white; border:1px solid #666;"
+            "font-size:20px;"
+            "}"
+            "QPushButton:hover { background-color:#3a3a3a; color:#ffb36a; border-color:#ff9b45; }"
+        )
+        small_play_style = (
+            "QPushButton {"
+            "background-color: rgba(20,20,20,190); color:white; border:1px solid #666;"
+            f"border-radius:{small_play_size // 2}px; font-size:{max(18, int(round(24 * scale)))}px;"
+            f"min-width:{small_play_size}px; min-height:{small_play_size}px;"
+            "}"
+            "QPushButton:hover { background-color:#3a3a3a; color:#ffb36a; border-color:#ff9b45; }"
+        )
+
+        self.prev_button.setFixedSize(prev_next_size, prev_next_size)
+        self.next_button.setFixedSize(prev_next_size, prev_next_size)
+        self.prev_button.setStyleSheet(button_style)
+        self.next_button.setStyleSheet(button_style)
+        self.play_button.setFixedSize(play_size, play_size)
+        self.play_button.setStyleSheet(play_style)
+        self.seek_back_button.setFixedSize(seek_size, seek_size)
+        self.seek_forward_button.setFixedSize(seek_size, seek_size)
+
+        self.small_play_button.setFixedSize(small_play_size, small_play_size)
+        self.small_play_button.setStyleSheet(small_play_style)
+        self.small_seek_back_button.setFixedSize(small_seek_size, small_seek_size)
+        self.small_seek_forward_button.setFixedSize(small_seek_size, small_seek_size)
+        self.small_next_button.setFixedSize(small_next_size, small_next_size)
+        self.small_next_button.setStyleSheet(
+            small_button_style +
+            f"QPushButton {{ border-radius:{small_next_size // 2}px; min-width:{small_next_size}px; min-height:{small_next_size}px; }}"
+        )
+
+    def change_control_icon_scale_by_wheel(self, delta: int, event=None, owner=None):
+        step_count = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+        self.control_icon_scale = max(0.7, min(2.5, self.control_icon_scale + step_count * 0.1))
+        self.apply_control_icon_scale()
+        widget = owner or self.play_button
+        if event is not None and hasattr(event, "globalPosition"):
+            tip_pos = event.globalPosition().toPoint() + QPoint(22, 0)
+        else:
+            tip_pos = widget.mapToGlobal(QPoint(widget.width() + 8, int(widget.height() / 2)))
+        QToolTip.showText(tip_pos, f"操作アイコン倍率 {int(round(self.control_icon_scale * 100))}%", widget)
+        app_log(f"Control icon scale changed: {self.control_icon_scale:.2f}")
+        self.save_settings()
+
     def change_volume_by_wheel(self, delta: int, event=None, owner=None):
         step_count = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
         new_volume = max(0.0, min(1.0, self.audio.volume() + step_count * 0.05))
@@ -3168,6 +3454,19 @@ class MiniDropPlayer(QWidget):
 
     def on_title_font_wheel_changed(self, delta: int, event):
         self.change_title_font_size_by_wheel(delta, event)
+
+    def eventFilter(self, obj, event):
+        if (
+            obj in getattr(self, "control_icon_widgets", [])
+            and event.type() == QEvent.Type.Wheel
+            and event.modifiers() & Qt.ControlModifier
+        ):
+            delta = event.angleDelta().y()
+            if delta:
+                self.change_control_icon_scale_by_wheel(delta, event, obj)
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
 
     def on_art_double_clicked(self):
         if self.is_one_shot_panel_mode:
@@ -3223,7 +3522,9 @@ class MiniDropPlayer(QWidget):
     def show_small_controls(self, show_next: bool):
         self.art_title_label.show()
         self.small_time_label.show()
+        self.small_seek_back_button.show()
         self.small_play_button.show()
+        self.small_seek_forward_button.show()
         self.small_next_button.setVisible(show_next)
         self.update_small_time_label()
 
@@ -3829,21 +4130,26 @@ class MiniDropPlayer(QWidget):
         )
         if result != QMessageBox.Yes:
             return
-        self.player.stop()
-        self.playlist = []
-        self.playlist_search_text = ""
-        self.current_index = -1
-        self.one_shot_path = None
-        self.update_playlist_panel()
-        self.update_playlist_toolbar_buttons()
-        self.update_left_panel_visibility()
-        self.update_random_art_pool()
-        self.title_label.setText(T("ここに音声ファイルをDrop"))
-        self.art_title_label.setText(T("ここに音声ファイルをDrop"))
-        self.art_label.setText("Album Art")
-        self.art_label.setPixmap(QPixmap())
+        self.clear_playlist()
+        self.set_current_playlist_name(self.generate_new_playlist_name())
         self.save_settings()
-        app_log("Playlist cleared")
+        app_log("Playlist cleared by confirmation")
+
+    def create_new_playlist(self):
+        if self.playlist:
+            result = QMessageBox.question(
+                self,
+                T("新しい再生リスト"),
+                T("現在の再生リストをクリアして、新しい再生リストを作成します。よろしいですか？"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if result != QMessageBox.Yes:
+                return
+        self.set_current_playlist_name(self.generate_new_playlist_name())
+        self.clear_playlist()
+        self.save_settings()
+        app_log(f"New playlist created: {self.current_playlist_name}")
 
     def write_wpl_playlist_file(self, playlist_path: Path):
         lines = ['<?wpl version="1.0"?>', '<smil>', '  <head>', '    <meta name="Generator" content="DropMp3"/>', '    <title>DropMp3 Playlist</title>', '  </head>', '  <body>', '    <seq>']
@@ -3874,13 +4180,24 @@ class MiniDropPlayer(QWidget):
     def playlist_timestamp(self) -> str:
         return datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    def generate_new_playlist_name(self) -> str:
+        return datetime.now().strftime("DropMp3_%y%m%d%H%M")
+
+    def sanitize_playlist_name(self, name: str | None) -> str:
+        text = re.sub(r'[\\/:*?"<>|]+', "_", str(name or "").strip())
+        text = text.rstrip(". ")
+        return text or self.generate_new_playlist_name()
+
+    def set_current_playlist_name(self, name: str | None):
+        self.current_playlist_name = self.sanitize_playlist_name(name)
+
     def default_playlist_path(self, suffix: str = ".m3u8") -> Path:
         conf_dir = self.app_base_dir() / "_conf" / "lst"
         try:
             conf_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             app_log(f"[PLAYLIST] _conf/lst create failed: {exc}")
-        return conf_dir / f"DropMp3_Playlist_{self.playlist_timestamp()}{suffix}"
+        return conf_dir / f"{self.current_playlist_name}{suffix}"
 
     def saved_playlist_files(self) -> list[Path]:
         roots = [
@@ -3891,7 +4208,7 @@ class MiniDropPlayer(QWidget):
         for root in roots:
             if not root.exists():
                 continue
-            for pattern in ("DropMp3_Playlist*.m3u8", "DropMp3_Playlist*.wpl", "playlist*.m3u8", "playlist*.wpl"):
+            for pattern in ("DropMp3_*.m3u8", "DropMp3_*.wpl", "DropMp3_Playlist*.m3u8", "DropMp3_Playlist*.wpl", "playlist*.m3u8", "playlist*.wpl"):
                 files.extend(root.glob(pattern))
         unique = {}
         for p in files:
@@ -3992,6 +4309,7 @@ class MiniDropPlayer(QWidget):
             self.current_index = -1
             self.one_shot_path = None
             self.drawer_open = False
+            self.set_current_playlist_name(path.stem)
             self.update_playlist_toolbar_buttons()
             self.update_playlist_panel()
             self.update_left_panel_visibility()
@@ -4041,6 +4359,7 @@ class MiniDropPlayer(QWidget):
                 if playlist_path.suffix.lower() != ".m3u8":
                     playlist_path = playlist_path.with_suffix(".m3u8")
                 self.write_m3u8_playlist_file(playlist_path)
+            self.set_current_playlist_name(playlist_path.stem)
             app_log(f"Playlist exported: {playlist_path}")
             QMessageBox.information(self, T("保存完了"), T("再生リストを保存しました。"))
         except Exception as e:
@@ -4064,6 +4383,7 @@ class MiniDropPlayer(QWidget):
                     lines.append(f'      <media src="{src}"/>')
             lines += ['    </seq>', '  </body>', '</smil>']
             playlist_path.write_text("\n".join(lines), encoding="utf-8-sig")
+            self.set_current_playlist_name(playlist_path.stem)
             app_log(f"WPL exported: {playlist_path}")
         except Exception as e:
             app_log(f"[WPL ERROR] {e}")
@@ -4094,6 +4414,7 @@ class MiniDropPlayer(QWidget):
                 lines.append(f"#EXTINF:{duration_sec},{title}")
                 lines.append(relative_or_absolute_path(path, playlist_path))
             playlist_path.write_text("\n".join(lines), encoding="utf-8-sig")
+            self.set_current_playlist_name(playlist_path.stem)
             app_log(f"M3U8 exported: {playlist_path}")
         except Exception as e:
             app_log(f"[M3U8 ERROR] {e}")
@@ -4984,6 +5305,7 @@ class MiniDropPlayer(QWidget):
         self.update_playlist_panel()
         self.update_playlist_toolbar_buttons()
         self.update_left_panel_visibility()
+        self.update_random_art_pool()
         self.save_settings()
 
     def keyPressEvent(self, event):
@@ -5035,7 +5357,9 @@ class MiniDropPlayer(QWidget):
         self.settings.setValue("playlist_font_size", int(self.playlist_font_size))
         self.settings.setValue("volume_font_size", int(self.volume_font_size))
         self.settings.setValue("title_font_size", int(self.title_font_size))
+        self.settings.setValue("control_icon_scale", float(self.control_icon_scale))
         self.settings.setValue("playlist_order_mode", self.playlist_order_mode)
+        self.settings.setValue("current_playlist_name", self.current_playlist_name)
         if hasattr(self, "main_splitter"):
             sizes = self.main_splitter.sizes()
             # 左ドロワーを閉じている時は left=0 になりやすいので、
@@ -5103,11 +5427,17 @@ class MiniDropPlayer(QWidget):
             self.title_font_size = max(16, min(72, int(self.settings.value("title_font_size", self.title_font_size))))
         except Exception:
             self.title_font_size = 28
+        try:
+            self.control_icon_scale = max(0.7, min(2.5, float(self.settings.value("control_icon_scale", self.control_icon_scale))))
+        except Exception:
+            self.control_icon_scale = 1.0
         self.playlist_order_mode = str(self.settings.value("playlist_order_mode", "") or "")
         if self.playlist_order_mode not in ("shuffle", "filename"):
             self.playlist_order_mode = ""
+        self.set_current_playlist_name(self.settings.value("current_playlist_name", self.current_playlist_name))
         self.apply_left_panel_style()
         self.apply_title_label_style()
+        self.apply_control_icon_scale()
         if hasattr(self, "volume_label"):
             self.volume_label.set_display_font_size(self.volume_font_size)
         self.update_startup_splash("字幕設定を読み込み中...", 78)
