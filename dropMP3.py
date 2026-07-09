@@ -2062,6 +2062,7 @@ class MiniDropPlayer(QWidget):
         self.remote_server = None
         self.playlist_window = None
         self.playlist_window_list = None
+        self.playlist_popup_menu = None
         self.exit_requested = False
 
         self.update_startup_splash("UIを構築中...", 38)
@@ -2174,12 +2175,18 @@ class MiniDropPlayer(QWidget):
 
     def about_image_path(self) -> Path | None:
         names = [
+            "DropMP3_about.png",
             "DropMP3.png",
             "DropMp3.png",
             "DropMP3_icon.png",
             "DropMP3_2.ico",
             "DropMP3.ico",
         ]
+        base_dir = self.app_base_dir()
+        for name in names:
+            path = base_dir / name
+            if path.exists():
+                return path
         for d in self.icon_search_dirs():
             for name in names:
                 path = d / name
@@ -2244,8 +2251,6 @@ class MiniDropPlayer(QWidget):
         player_action = QAction(T("Player表示"), self)
         player_action.triggered.connect(self.restore_from_tray)
         menu.addAction(player_action)
-
-        self.populate_tray_playlist_preview(menu)
 
         menu.addSeparator()
 
@@ -2351,6 +2356,12 @@ class MiniDropPlayer(QWidget):
                 self.log_window.hide()
         except Exception:
             pass
+        playlist_popup_menu = getattr(self, "playlist_popup_menu", None)
+        if playlist_popup_menu is not None:
+            try:
+                playlist_popup_menu.close()
+            except Exception:
+                pass
         playlist_window = getattr(self, "playlist_window", None)
         if playlist_window is not None:
             try:
@@ -5064,41 +5075,37 @@ Start-Process -FilePath $exePath
         dialog.raise_()
         dialog.activateWindow()
 
+    def tray_menu_popup_pos(self) -> QPoint:
+        cursor_pos = QCursor.pos()
+        return QPoint(cursor_pos.x(), cursor_pos.y() - 36)
+
     def show_playlist_window(self):
-        if self.playlist_window is None:
-            dialog = QDialog(None)
-            dialog.setWindowTitle(T("プレイリスト表示"))
-            dialog.setModal(False)
-            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
-            dialog.setWindowFlag(Qt.WindowType.Tool, True)
-            dialog.setStyleSheet("""
-                QDialog{background:#181818;color:#eeeeee;}
-                QListWidget{background:#101010;color:#eeeeee;border:1px solid #333;outline:none;}
-                QListWidget::item{padding:6px;border-bottom:1px solid #242424;}
-                QListWidget::item:selected{background:#2d4a35;color:#fff;}
-                QLabel{color:#dfffe7;font-weight:bold;}
-                QPushButton{background:#2b2b2b;color:#fff;border:1px solid #666;border-radius:5px;padding:6px 16px;}
-                QPushButton:hover{background:#1d3828;border-color:#41db78;}
-            """)
-            layout = QVBoxLayout(dialog)
-            layout.setContentsMargins(10, 10, 10, 10)
-            layout.setSpacing(8)
-            title = QLabel(T("現在の再生リスト"))
-            layout.addWidget(title)
-            list_widget = QListWidget()
-            list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
-            list_widget.itemDoubleClicked.connect(lambda item: self.play_playlist_window_index(int(item.data(Qt.UserRole))))
-            layout.addWidget(list_widget, 1)
-            close_button = QPushButton(T("閉じる"))
-            close_button.clicked.connect(dialog.hide)
-            layout.addWidget(close_button, alignment=Qt.AlignRight)
-            dialog.resize(560, 520)
-            self.playlist_window = dialog
-            self.playlist_window_list = list_widget
-        self.refresh_playlist_window()
-        self.playlist_window.show()
-        self.playlist_window.raise_()
-        self.playlist_window.activateWindow()
+        popup = getattr(self, "playlist_popup_menu", None)
+        if popup is not None:
+            try:
+                popup.close()
+            except Exception:
+                pass
+
+        menu = QMenu(self)
+        menu.setStyleSheet(self.menu_style())
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        menu.setToolTipsVisible(True)
+
+        title_action = QAction(T("現在の再生リスト"), self)
+        title_action.setEnabled(False)
+        menu.addAction(title_action)
+        menu.addSeparator()
+        self.populate_tray_playlist_preview(menu)
+
+        self.playlist_popup_menu = menu
+
+        def clear_popup_ref():
+            if getattr(self, "playlist_popup_menu", None) is menu:
+                self.playlist_popup_menu = None
+
+        menu.aboutToHide.connect(clear_popup_ref)
+        menu.popup(self.tray_menu_popup_pos())
 
     def play_playlist_window_index(self, index: int):
         if 0 <= index < len(self.playlist):

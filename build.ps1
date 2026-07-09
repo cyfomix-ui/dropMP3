@@ -16,6 +16,7 @@ $DistDir = Join-Path $RootDir "dist"
 $BuildDir = Join-Path $RootDir "build"
 $SpecPath = Join-Path $RootDir "$AppName.spec"
 $IconPath = Join-Path $RootDir "DropMP3.ico"
+$AboutImagePath = Join-Path $RootDir "DropMP3_about.png"
 $SplashPng = Join-Path $RootDir "pyinstaller_assets\DropMP3_boot_splash_hires.png"
 if (!(Test-Path -LiteralPath $SplashPng)) {
     $SplashPng = Join-Path $RootDir "DropMP3_boot_splash.png"
@@ -40,6 +41,10 @@ if (!(Test-Path $MainPath)) {
 
 if (!(Test-Path -LiteralPath $IconPath)) {
     throw "EXEアイコンが見つかりません: $IconPath"
+}
+
+if (!(Test-Path -LiteralPath $AboutImagePath)) {
+    throw "About画像が見つかりません: $AboutImagePath"
 }
 
 # ==============================
@@ -96,6 +101,7 @@ python -m PyInstaller `
     --hidden-import mutagen.oggvorbis `
     --hidden-import mutagen.wave `
     --add-data "$IconPath;." `
+    --add-data "$AboutImagePath;." `
     --add-data "$SplashPng;." `
     --add-data "$((Resolve-Path -LiteralPath '.\_conf').Path);_conf" `
     $MainPath

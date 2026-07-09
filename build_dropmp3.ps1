@@ -28,6 +28,15 @@ function First-ExistingPath([string[]]$Candidates) {
 }
 
 $scriptPath = Resolve-RequiredPath $Script "Source"
+$aboutImagePath = $null
+$aboutImageCandidates = @(
+    ".\DropMP3_about.png",
+    ".\DropMp3_about.png"
+)
+$aboutImagePath = First-ExistingPath $aboutImageCandidates
+if ($null -eq $aboutImagePath) {
+    throw "About image not found. Expected one of: $($aboutImageCandidates -join ', ')"
+}
 $iconPath = $null
 if (Test-Path -LiteralPath $ExeIcon) {
     $iconPath = (Resolve-Path -LiteralPath $ExeIcon).Path
@@ -141,6 +150,7 @@ if (!$NoSplash -and $splashPng -and (Test-Path -LiteralPath $splashPng)) { $args
 
 # Runtime assets: include icons/images if your app refers to them.
 if ($iconPath) { $args += @("--add-data", "$iconPath;.") }
+if ($aboutImagePath) { $args += @("--add-data", "$aboutImagePath;.") }
 if ($splashSource -and (Test-Path -LiteralPath $splashSource)) { $args += @("--add-data", "$splashSource;.") }
 if ($splashPng -and (Test-Path -LiteralPath $splashPng)) { $args += @("--add-data", "$splashPng;.") }
 if (Test-Path -LiteralPath ".\_conf") { $args += @("--add-data", "$((Resolve-Path -LiteralPath '.\_conf').Path);_conf") }
