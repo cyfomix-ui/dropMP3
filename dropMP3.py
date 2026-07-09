@@ -5,12 +5,19 @@ import time
 import random
 import math
 import re
+import socket
+import threading
+import http.server
+import socketserver
 import mimetypes
 import shutil
 import subprocess
+import tempfile
+import hashlib
 import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from html import escape
@@ -48,6 +55,7 @@ from PySide6.QtGui import (
     QDesktopServices,
     QShortcut,
     QTextCursor,
+    QCursor,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -82,12 +90,13 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
     QHeaderView,
     QProgressBar,
+    QProgressDialog,
     QFontComboBox,
     QSpinBox,
     QColorDialog,
     QInputDialog,
 )
-from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 
 from mutagen import File as MutagenFile
 
@@ -101,6 +110,156 @@ TEXT_PLAYLIST_EXTS = {".txt", ".list", ".playlist"}
 LIST_FILE_EXTS = PLAYLIST_EXTS | TEXT_PLAYLIST_EXTS
 
 APP_START_MONO = time.perf_counter()
+APP_NAME = "DropMP3"
+APP_GITHUB_REPO = "cyfomix-ui/dropMP3"
+APP_VERSION_FALLBACK = "1.00"
+APP_VERSION_FILE = "_conf/app_version.xml"
+APP_VERSION_LEGACY_FILE = "_conf/app_version.json"
+APP_UPDATE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
+APP_UPDATE_TIMEOUT_SEC = 15
+
+
+def read_app_version(base_dir: Path | None = None) -> str:
+    if base_dir is not None:
+        version_path = Path(base_dir) / APP_VERSION_FILE
+        try:
+            if version_path.exists():
+                root = ET.fromstring(version_path.read_text(encoding="utf-8"))
+                value = str(root.findtext("version", "") or "").strip()
+                if value:
+                    return value
+        except Exception as exc:
+            app_log(f"[UPDATE] version file read failed: {exc}")
+        legacy_path = Path(base_dir) / APP_VERSION_LEGACY_FILE
+        try:
+            if legacy_path.exists():
+                payload = json.loads(legacy_path.read_text(encoding="utf-8"))
+                value = str(payload.get("version", "") or "").strip()
+                if value:
+                    return normalize_version_text(value)
+        except Exception as exc:
+            app_log(f"[UPDATE] legacy version file read failed: {exc}")
+    return APP_VERSION_FALLBACK
+
+
+def format_version_label(version: str) -> str:
+    value = normalize_version_text(version) or APP_VERSION_FALLBACK
+    return f"v{value}"
+
+
+def normalize_version_text(text: str) -> str:
+    value = str(text or "").strip()
+    if value.lower().startswith("ver "):
+        value = value[4:].strip()
+    if value.lower().startswith("v"):
+        value = value[1:].strip()
+    return value
+
+
+def version_sort_key(text: str) -> tuple:
+    normalized = normalize_version_text(text)
+    parts: list[int | str] = []
+    for chunk in re.split(r"[.\-_+]", normalized):
+        if not chunk:
+            continue
+        if chunk.isdigit():
+            parts.append(int(chunk))
+        else:
+            parts.append(chunk.lower())
+    return tuple(parts)
+
+
+def fetch_latest_release_metadata() -> dict:
+    req = urllib.request.Request(
+        APP_UPDATE_API_URL,
+        headers={
+            "User-Agent": f"{APP_NAME}-updater",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=APP_UPDATE_TIMEOUT_SEC) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def select_release_asset(release: dict) -> dict | None:
+    assets = release.get("assets") or []
+    if not isinstance(assets, list):
+        return None
+    candidates = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name", "") or "")
+        lowered = name.lower()
+        score = 0
+        if lowered.endswith(".zip"):
+            score += 100
+        if lowered.endswith(".exe"):
+            score += 60
+        if "dropmp3" in lowered:
+            score += 20
+        if "portable" in lowered:
+            score += 5
+        if score > 0:
+            candidates.append((score, asset))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], str(item[1].get("name", ""))))
+    return candidates[0][1]
+
+
+def collect_startup_audio_files(argv: list[str]) -> list[Path]:
+    files: list[Path] = []
+    seen: set[str] = set()
+    for raw in argv:
+        text = str(raw or "").strip().strip('"')
+        if not text:
+            continue
+        path = Path(text)
+        try:
+            if not path.exists() or not path.is_file():
+                continue
+        except Exception:
+            continue
+        if path.suffix.lower() not in AUDIO_EXTS:
+            continue
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        files.append(resolved)
+    return files
+
+
+def try_forward_one_shot_to_existing_instance(paths: list[Path], port: int = 8765) -> bool:
+    if not paths:
+        return False
+    target = Path(paths[0])
+    payload = urllib.parse.urlencode({"path": str(target)}).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{int(port)}/api/oneshot",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=1.2) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return bool(data.get("ok"))
+    except Exception:
+        return False
+
+
+class UpdateWorkerBridge(QObject):
+    checkFinished = Signal(dict)
+    progressChanged = Signal(int, str)
+    downloadFinished = Signal(dict)
+    updateError = Signal(dict)
+
 
 
 # -----------------------------------------------------------------------------
@@ -327,6 +486,25 @@ _UI_TRANSLATIONS_EN = {
     'このアイコンに音楽ファイルをDropするとワンショットで再生されます': 'Drop an audio file on this icon to play it as a one-shot.',
     'ワンショット再生モード ON/OFF\nONの間は、ドロップした曲をリストに追加せず一時再生します\nこのアイコンに音楽ファイルをDropするとワンショットで再生されます': 'One-shot playback mode ON/OFF\nWhile ON, dropped tracks play temporarily without being added to the list.\nDrop an audio file on this icon to play it as a one-shot.',
     'このアイコンに音楽ファイルをDropするとワンショットで再生されます\nワンショット再生後、約0.3秒後に通常再生へ戻ります': 'Drop an audio file on this icon to play it as a one-shot.\nAfter one-shot playback, normal playback resumes after about 0.3 seconds.',
+    'GitHub Release の更新確認': 'Check GitHub Release updates',
+    'この実行形態では自動更新できません。Release ページを開きますか？': 'Auto-update is not available in this run mode. Open the Release page instead?',
+    'ダウンロード中...': 'Downloading...',
+    'ダウンロード完了': 'Download completed',
+    'ダウンロード失敗': 'Download failed',
+    '更新': 'Update',
+    '更新を開始できませんでした。\n\n': 'Could not start the update.\n\n',
+    '更新エラー': 'Update error',
+    '更新確認': 'Update check',
+    '更新確認を実行中です。': 'Update check is already running.',
+    '更新確認に失敗しました。\n\n': 'Failed to check for updates.\n\n',
+    '最新版です。': 'This is the latest version.',
+    '最新版を確認できませんでした。': 'Could not determine the latest version.',
+    '最新版があります。\n\n現在: ': 'A newer version is available.\n\nCurrent: ',
+    '\n最新版: ': '\nLatest: ',
+    '\n\n今すぐダウンロードして更新しますか？': '\n\nDownload and update now?',
+    '更新用ファイルのダウンロードが完了しました。\n\n今すぐアプリを終了して更新を適用しますか？': 'The update package has been downloaded.\n\nQuit now and apply the update?',
+    '配布アセットが見つかりませんでした。': 'No release asset was found.',
+    '起動中の EXE を置き換えるため、アプリを一度終了してから更新します。設定とプレイリストは保持します。': 'The app will close once so the running EXE can be replaced. Settings and playlists will be preserved.',
 }
 
 
@@ -340,10 +518,11 @@ def T(text: str) -> str:
 class StartupSplash(QWidget):
     """Small startup window that shows visible boot progress until the main UI appears."""
 
-    def __init__(self):
+    def __init__(self, app_version: str = ""):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setFixedSize(520, 230)
+        self.app_version = normalize_version_text(app_version) or APP_VERSION_FALLBACK
 
         outer = QFrame(self)
         outer.setObjectName("splashOuter")
@@ -386,10 +565,10 @@ class StartupSplash(QWidget):
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(10)
 
-        title = QLabel("DropMp3")
-        title.setObjectName("splashTitle")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(title)
+        self.title_label = QLabel(f"DropMp3 {format_version_label(self.app_version)}")
+        self.title_label.setObjectName("splashTitle")
+        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.title_label)
 
         self.status_label = QLabel(T("起動準備中..."))
         self.status_label.setObjectName("splashStatus")
@@ -401,7 +580,7 @@ class StartupSplash(QWidget):
         self.progress.setValue(3)
         layout.addWidget(self.progress)
 
-        self.log_label = QLabel(T("DropMp3 起動中"))
+        self.log_label = QLabel(f"DropMp3 {format_version_label(self.app_version)}")
         self.log_label.setObjectName("splashLog")
         self.log_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.log_label.setWordWrap(True)
@@ -512,6 +691,272 @@ def bool_from_settings(value, default=False) -> bool:
         return value
     return str(value).lower() in ("true", "1", "yes", "on")
 
+
+
+
+class RemoteCommandBridge(QObject):
+    """Run HTTP remote commands on the Qt/UI thread."""
+
+    execute_requested = Signal(str, object, object)
+
+    def __init__(self, owner):
+        super().__init__(owner)
+        self.owner = owner
+        self.execute_requested.connect(self._execute)
+
+    def invoke(self, command: str, params: dict, timeout_sec: float = 8.0) -> dict:
+        done = threading.Event()
+        box = {"result": None}
+        self.execute_requested.emit(str(command or ""), dict(params or {}), (done, box))
+        if not done.wait(timeout_sec):
+            return {"ok": False, "error": "remote command timed out"}
+        result = box.get("result")
+        if isinstance(result, dict):
+            return result
+        return {"ok": False, "error": "remote command returned invalid result"}
+
+    def _execute(self, command: str, params: object, token: object):
+        done, box = token
+        try:
+            box["result"] = self.owner.remote_handle_command(str(command or ""), dict(params or {}))
+        except Exception as exc:
+            app_log(f"[REMOTE] command failed: {command}: {exc}")
+            box["result"] = {"ok": False, "error": str(exc)}
+        finally:
+            done.set()
+
+
+class _RemoteThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+class _RemoteRequestHandler(http.server.BaseHTTPRequestHandler):
+    server_version = "DropMp3Remote/1.0"
+
+    def log_message(self, fmt, *args):
+        try:
+            app_log("[REMOTE] " + (fmt % args))
+        except Exception:
+            pass
+
+    def _send_bytes(self, data: bytes, content_type: str = "application/json; charset=utf-8", status: int = 200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Remote-Token")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def _send_json(self, payload: dict, status: int = 200):
+        self._send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"), status=status)
+
+    def _params_from_query(self, parsed):
+        params = {}
+        for key, values in urllib.parse.parse_qs(parsed.query, keep_blank_values=True).items():
+            params[key] = values[-1] if values else ""
+        return params
+
+    def _read_body_params(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        ctype = (self.headers.get("Content-Type") or "").lower()
+        try:
+            text = raw.decode("utf-8")
+        except Exception:
+            text = raw.decode("utf-8", errors="replace")
+        if "application/json" in ctype:
+            try:
+                data = json.loads(text or "{}")
+                return data if isinstance(data, dict) else {}
+            except Exception:
+                return {}
+        params = {}
+        for key, values in urllib.parse.parse_qs(text, keep_blank_values=True).items():
+            params[key] = values[-1] if values else ""
+        return params
+
+    def _authorized(self, params: dict) -> bool:
+        token = str(getattr(self.server, "remote_token", "") or "")
+        if not token:
+            return True
+        request_token = str(params.get("token") or self.headers.get("X-Remote-Token") or "")
+        return request_token == token
+
+    def do_OPTIONS(self):
+        self._send_bytes(b"", status=204)
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = self._params_from_query(parsed)
+        if not self._authorized(params):
+            self._send_json({"ok": False, "error": "unauthorized"}, status=403)
+            return
+        if parsed.path in ("/", "/index.html"):
+            html = remote_control_html(getattr(self.server, "remote_app_name", "DropMp3"))
+            self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if parsed.path == "/api/status":
+            self._send_json(self.server.remote_bridge.invoke("status", params))
+            return
+        if parsed.path == "/api/playlist":
+            self._send_json(self.server.remote_bridge.invoke("playlist", params))
+            return
+        self._send_json({"ok": False, "error": "not found"}, status=404)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        params = self._params_from_query(parsed)
+        params.update(self._read_body_params())
+        if not self._authorized(params):
+            self._send_json({"ok": False, "error": "unauthorized"}, status=403)
+            return
+        prefix = "/api/"
+        if not parsed.path.startswith(prefix):
+            self._send_json({"ok": False, "error": "not found"}, status=404)
+            return
+        command = parsed.path[len(prefix):].strip().lower()
+        self._send_json(self.server.remote_bridge.invoke(command, params))
+
+
+def remote_control_html(app_name: str) -> str:
+    app_label = escape(str(app_name or "DropMp3"))
+    return """<!doctype html>
+<html lang=\"ja\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>__APP_NAME__ HTTPリモコン</title>
+<style>
+body{font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#111;color:#eee;margin:0;padding:16px;}
+h1{font-size:22px;margin:0 0 12px;} .panel{background:#1b1b1b;border:1px solid #333;border-radius:12px;padding:12px;margin:0 0 12px;}
+button{font-size:16px;margin:4px;padding:8px 12px;border-radius:8px;border:1px solid #555;background:#2a2a2a;color:#eee;}
+button:hover{background:#3a3a3a;} input[type=range]{width:min(420px,90vw);} .now{font-weight:700;color:#ffd27d;}
+.item{display:flex;gap:8px;align-items:center;border-top:1px solid #333;padding:8px 0;} .item:first-child{border-top:0;} .idx{width:3em;color:#aaa;} .title{flex:1;overflow-wrap:anywhere;}
+.small{color:#aaa;font-size:12px;overflow-wrap:anywhere;} .current{background:#222b37;border-radius:8px;padding-left:6px;}
+</style>
+</head>
+<body>
+<h1>__APP_NAME__ HTTPリモコン</h1>
+<div class=\"panel\">
+  <div id=\"status\">接続中...</div>
+  <div style=\"margin-top:8px\">
+    <button onclick=\"post('play')\">再生</button>
+    <button onclick=\"post('pause')\">一時停止</button>
+    <button onclick=\"post('toggle')\">再生/一時停止</button>
+    <button onclick=\"post('stop')\">停止</button>
+    <button onclick=\"post('prev')\">前へ</button>
+    <button onclick=\"post('next')\">次へ</button>
+  </div>
+  <div style=\"margin-top:8px\">音量 <input id=\"vol\" type=\"range\" min=\"0\" max=\"100\" value=\"80\" oninput=\"setVolume(this.value)\"> <span id=\"volText\">80%</span></div>
+  <div style=\"margin-top:8px\">位置 <input id=\"seek\" type=\"range\" min=\"0\" max=\"0\" value=\"0\" onchange=\"seekTo(this.value)\"> <span id=\"posText\">0:00 / 0:00</span></div>
+</div>
+<div class=\"panel\"><div class=\"small\">リスト項目の「再生」を押すと、リモート先PC上のPlayerで鳴ります。</div><div id=\"playlist\"></div></div>
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+let lastStatus = null;
+function apiUrl(path, params={}){ const u = new URL(path, location.href); Object.entries(params).forEach(([k,v])=>u.searchParams.set(k,v)); if(token) u.searchParams.set('token', token); return u; }
+async function get(path, params={}){ const r = await fetch(apiUrl(path, params)); return await r.json(); }
+async function post(cmd, params={}){ const r = await fetch(apiUrl('/api/'+cmd, params), {method:'POST'}); const j = await r.json(); await refresh(); return j; }
+function fmt(ms){ ms = Math.max(0, Number(ms||0)); const s = Math.floor(ms/1000); const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), sec=s%60; return h>0 ? `${h}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}` : `${m}:${String(sec).padStart(2,'0')}`; }
+async function setVolume(v){ document.getElementById('volText').textContent = v+'%'; await post('volume', {value:v}); }
+async function seekTo(v){ await post('seek', {ms:v}); }
+async function playIndex(i){ await post('play', {index:i}); }
+function renderStatus(s){ lastStatus=s; document.getElementById('status').innerHTML = `<div>状態: <span class=\"now\">${s.state_text||s.state}</span></div><div>現在: <span class=\"now\">${s.title||'(なし)'}</span></div><div class=\"small\">${s.path||''}</div>`; document.getElementById('vol').value=Math.round(Number(s.volume||0)*100); document.getElementById('volText').textContent=Math.round(Number(s.volume||0)*100)+'%'; const seek=document.getElementById('seek'); seek.max=Math.max(0, Number(s.duration_ms||0)); seek.value=Math.max(0, Number(s.position_ms||0)); document.getElementById('posText').textContent=fmt(s.position_ms)+' / '+fmt(s.duration_ms); }
+function renderPlaylist(p){ const root=document.getElementById('playlist'); const items=p.items||[]; root.innerHTML = items.map(it => `<div class=\"item ${it.current?'current':''}\"><div class=\"idx\">#${it.index}</div><button onclick=\"playIndex(${it.index})\">再生</button><div class=\"title\">${escapeHtml(it.title||'')}<div class=\"small\">${escapeHtml(it.path||'')}</div></div></div>`).join('') || '<div class=\"small\">プレイリストは空です。</div>'; }
+function escapeHtml(s){ return String(s).replace(/[&<>\"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c])); }
+async function refresh(){ try{ const s=await get('/api/status'); if(s.ok) renderStatus(s); const p=await get('/api/playlist'); if(p.ok) renderPlaylist(p); }catch(e){ document.getElementById('status').textContent='接続できません: '+e; } }
+refresh(); setInterval(refresh, 1500);
+</script>
+</body></html>""".replace("__APP_NAME__", app_label)
+
+
+class RemoteControlServer:
+    def __init__(self, owner, app_name: str, default_port: int):
+        self.owner = owner
+        self.app_name = app_name
+        self.default_port = int(default_port)
+        self.bridge = RemoteCommandBridge(owner)
+        self.httpd = None
+        self.thread = None
+        self.url = ""
+        self.lan_urls: list[str] = []
+
+    def start(self):
+        settings = getattr(self.owner, "settings", None)
+        enabled = True
+        host = "0.0.0.0"
+        port = self.default_port
+        token = ""
+        try:
+            if settings is not None:
+                enabled = bool_from_settings(settings.value("remote/enabled", True), True)
+                host = str(settings.value("remote/host", host) or host).strip() or host
+                port = int(settings.value("remote/port", port) or port)
+                token = str(settings.value("remote/token", "") or "")
+        except Exception as exc:
+            app_log(f"[REMOTE] settings read failed: {exc}")
+        if not enabled:
+            app_log("[REMOTE] HTTP remote control is disabled")
+            return
+        last_error = None
+        for candidate in range(max(1, port), max(1, port) + 20):
+            try:
+                httpd = _RemoteThreadingHTTPServer((host, candidate), _RemoteRequestHandler)
+                httpd.remote_bridge = self.bridge
+                httpd.remote_token = token
+                httpd.remote_app_name = self.app_name
+                self.httpd = httpd
+                display_host = "127.0.0.1" if host in ("", "0.0.0.0", "::") else host
+                self.url = f"http://{display_host}:{candidate}/"
+                self.lan_urls = self._collect_lan_urls(candidate) if host in ("0.0.0.0", "::", "") else []
+                self.thread = threading.Thread(target=httpd.serve_forever, name=f"{self.app_name}RemoteHTTP", daemon=True)
+                self.thread.start()
+                app_log(f"[REMOTE] listening: {self.url}")
+                for url in self.lan_urls:
+                    app_log(f"[REMOTE] LAN URL: {url}")
+                if token:
+                    app_log("[REMOTE] token authentication is enabled")
+                else:
+                    app_log("[REMOTE] token authentication is disabled")
+                return
+            except OSError as exc:
+                last_error = exc
+                continue
+        app_log(f"[REMOTE] failed to start HTTP remote control: {last_error}")
+
+    def _collect_lan_urls(self, port: int) -> list[str]:
+        urls = []
+        seen = set()
+        try:
+            hostname = socket.gethostname()
+            for info in socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM):
+                ip = info[4][0]
+                if ip.startswith("127.") or ip in seen:
+                    continue
+                seen.add(ip)
+                urls.append(f"http://{ip}:{port}/")
+        except Exception:
+            pass
+        return urls
+
+    def shutdown(self):
+        httpd = self.httpd
+        self.httpd = None
+        if httpd is None:
+            return
+        try:
+            app_log("[REMOTE] shutting down HTTP remote control")
+            httpd.shutdown()
+            httpd.server_close()
+        except Exception as exc:
+            app_log(f"[REMOTE] shutdown failed: {exc}")
 
 def relative_or_absolute_path(media_path: Path, playlist_path: Path) -> str:
     try:
@@ -879,6 +1324,44 @@ class VolumeLabel(QLabel):
         )
         super().enterEvent(event)
 
+
+
+class TimeDisplayLabel(QLabel):
+    wheelChanged = Signal(int, object)
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._display_font_size = 12
+        self.setToolTip(T("Ctrl+ホイール: 時間表示文字サイズ変更"))
+        self.apply_display_style()
+
+    def set_display_font_size(self, size: int):
+        self._display_font_size = max(8, min(28, int(size)))
+        self.apply_display_style()
+
+    def apply_display_style(self):
+        font = QFont(self.font())
+        font.setPixelSize(self._display_font_size)
+        self.setFont(font)
+        metrics = QFontMetrics(font)
+        self.setMinimumWidth(max(48, metrics.horizontalAdvance("00:00:00") + 8))
+        self.setStyleSheet("""
+            QLabel {
+                color:#d0d0d0;
+                background:transparent;
+            }
+            QLabel:hover {
+                color:#ffb36a;
+            }
+        """)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta != 0 and event.modifiers() & Qt.ControlModifier:
+            self.wheelChanged.emit(delta, event)
+            event.accept()
+            return
+        super().wheelEvent(event)
 
 
 class SubtitleFontDialog(QDialog):
@@ -1474,9 +1957,19 @@ class MiniDropPlayer(QWidget):
             },
         }
         self.settings = QSettings(str(self.conf_dir / "DropMp3.ini"), QSettings.Format.IniFormat)
+        self.current_app_version = read_app_version(self.app_base_dir())
+        self.update_bridge = UpdateWorkerBridge(self)
+        self.update_bridge.checkFinished.connect(self.on_update_check_finished)
+        self.update_bridge.progressChanged.connect(self.on_update_download_progress)
+        self.update_bridge.downloadFinished.connect(self.on_update_download_finished)
+        self.update_bridge.updateError.connect(self.on_update_error)
+        self.update_progress_dialog = None
+        self.update_download_context = None
+        self.update_check_in_progress = False
+        self.update_download_in_progress = False
         self.update_startup_splash("起動準備中...", 8)
 
-        self.setWindowTitle("DropMp3")
+        self.setWindowTitle(f"DropMp3 {format_version_label(self.current_app_version)}")
         self.update_startup_splash("アイコンを読み込み中...", 12)
         self.apply_app_icon()
         self.setAcceptDrops(True)
@@ -1519,10 +2012,12 @@ class MiniDropPlayer(QWidget):
         self.subtitle_secondary_cues: list[tuple[int, int, str]] = []
         self.subtitle_display_mode = 0
         self.subtitles_manually_hidden = False
+        self.subtitle_auto_show_enabled = True
         self.left_playlist_visible = False
         self.drawer_open = False
         self.playlist_font_size = 12
         self.volume_font_size = 12
+        self.time_font_size = 12
         self.title_font_size = 28
         self.control_icon_scale = 1.0
         self.playlist_order_mode = ""
@@ -1551,8 +2046,10 @@ class MiniDropPlayer(QWidget):
         self.update_startup_splash("メインウィンドウを準備中...", 22)
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
+        self.media_devices = QMediaDevices(self)
         self.player.setAudioOutput(self.audio)
         self.audio.setVolume(0.8)
+        self.last_known_default_audio_device_id = self.audio_device_id(QMediaDevices.defaultAudioOutput())
         self.subtitle_source_language = str(self.settings.value("subtitle/source_language", "auto") or "auto")
         self.subtitle_target_language = str(self.settings.value("subtitle/target_language", "ja") or "ja")
         self.ollama_model = str(self.settings.value("subtitle/ollama_model", "llama3.1") or "llama3.1")
@@ -1561,6 +2058,11 @@ class MiniDropPlayer(QWidget):
         LOG_BUS.message.connect(self.log_window.append)
 
         self.tray_icon = None
+        self.tray_menu = None
+        self.remote_server = None
+        self.playlist_window = None
+        self.playlist_window_list = None
+        self.exit_requested = False
 
         self.update_startup_splash("UIを構築中...", 38)
         self.build_ui()
@@ -1571,6 +2073,8 @@ class MiniDropPlayer(QWidget):
         self.setup_tray_icon()
         self.update_startup_splash("設定とプレイリストを復元中...", 72)
         self.load_settings()
+        self.setup_remote_control()
+        QTimer.singleShot(1800, self.schedule_startup_update_check)
 
         self.autosave_timer = QTimer(self)
         self.autosave_timer.timeout.connect(self.save_settings)
@@ -1668,6 +2172,32 @@ class MiniDropPlayer(QWidget):
             if app is not None:
                 app.setWindowIcon(icon)
 
+    def about_image_path(self) -> Path | None:
+        names = [
+            "DropMP3.png",
+            "DropMp3.png",
+            "DropMP3_icon.png",
+            "DropMP3_2.ico",
+            "DropMP3.ico",
+        ]
+        for d in self.icon_search_dirs():
+            for name in names:
+                path = d / name
+                if path.exists():
+                    return path
+        return None
+
+    def current_track_tooltip_text(self) -> str:
+        path = self.current_media_path()
+        if path is None:
+            return T("曲なし")
+        return self.get_display_title(path)
+
+    def build_tray_tooltip(self) -> str:
+        header = f"DropMp3 - Version {normalize_version_text(self.current_app_version)}"
+        current = self.current_track_tooltip_text()
+        return f"{header}\n{current}" if current else header
+
     def setup_tray_icon(self):
         T("""タスクトレイ格納用のアイコンとメニューを準備する。""")
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -1689,29 +2219,81 @@ class MiniDropPlayer(QWidget):
             app_log("Tray icon is non-null")
 
         self.tray_icon = QSystemTrayIcon(icon, self)
-        self.tray_icon.setToolTip("DropMp3")
+        self.tray_icon.setToolTip(self.build_tray_tooltip())
+        self.tray_menu = QMenu(self)
+        self.tray_menu.setStyleSheet(self.menu_style())
+        self.tray_menu.aboutToShow.connect(self.rebuild_tray_menu)
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.rebuild_tray_menu()
+        self.tray_icon.show()
+        app_log("System tray icon prepared")
 
-        menu = QMenu()
-        show_action = QAction(T("表示"), self)
-        show_action.triggered.connect(self.restore_from_tray)
-        menu.addAction(show_action)
+    def rebuild_tray_menu(self):
+        menu = getattr(self, "tray_menu", None)
+        if menu is None:
+            return
+        menu.clear()
 
-        play_action = QAction(T("再生 / 一時停止"), self)
-        play_action.triggered.connect(self.toggle_play)
-        menu.addAction(play_action)
-
-        next_action = QAction(T("次の曲"), self)
-        next_action.triggered.connect(self.play_next)
-        menu.addAction(next_action)
+        settings_action = QAction(T("設定"), self)
+        settings_action.triggered.connect(lambda checked=False: QTimer.singleShot(0, lambda: self.show_gear_menu(QCursor.pos())))
+        menu.addAction(settings_action)
 
         menu.addSeparator()
+
+        player_action = QAction(T("Player表示"), self)
+        player_action.triggered.connect(self.restore_from_tray)
+        menu.addAction(player_action)
+
+        self.populate_tray_playlist_preview(menu)
+
+        menu.addSeparator()
+
+        about_action = QAction(self.help_label("DropMp3について", "About DropMp3"), self)
+        about_action.triggered.connect(lambda checked=False: self.show_about_dialog())
+        menu.addAction(about_action)
+
+        help_action = QAction("Help", self)
+        help_action.triggered.connect(lambda checked=False: QTimer.singleShot(0, lambda: self.show_help_menu(QCursor.pos())))
+        menu.addAction(help_action)
+
+        menu.addSeparator()
+
         exit_action = QAction(T("終了"), self)
         exit_action.triggered.connect(self.exit_application)
         menu.addAction(exit_action)
 
-        self.tray_icon.setContextMenu(menu)
-        self.tray_icon.activated.connect(self.on_tray_activated)
-        app_log("System tray icon prepared")
+    def tray_playlist_preview_indices(self) -> list[int]:
+        if not self.playlist:
+            return []
+        center = self.current_index if self.one_shot_path is None else self.last_list_index_before_one_shot
+        if center < 0:
+            center = 0
+        start = max(0, center - 5)
+        end = min(len(self.playlist), center + 5)
+        if end - start < 10:
+            start = max(0, end - 10)
+            end = min(len(self.playlist), start + 10)
+        return list(range(start, end))
+
+    def populate_tray_playlist_preview(self, menu: QMenu):
+        indices = self.tray_playlist_preview_indices()
+        if not indices:
+            empty_action = QAction(T("曲がありません"), self)
+            empty_action.setEnabled(False)
+            menu.addAction(empty_action)
+            return
+        header_action = QAction(T("再生中前後のプレイリスト"), self)
+        header_action.setEnabled(False)
+        menu.addAction(header_action)
+        for idx in indices:
+            path = self.playlist[idx]
+            prefix = "▶ " if idx == self.current_index and self.one_shot_path is None else "   "
+            title = self.get_display_title(path)
+            action = QAction(f"{prefix}{idx + 1:02d}. {title}", self)
+            action.setToolTip(str(path))
+            action.triggered.connect(lambda checked=False, i=idx: self.play_index(i, autoplay=True))
+            menu.addAction(action)
 
     def minimize_to_tray(self):
         T("""通常Playerの最小化ボタンなどから、タスクトレイへ格納する。""")
@@ -1726,6 +2308,7 @@ class MiniDropPlayer(QWidget):
             self.settings.setValue("art_only_geometry", self.geometry())
 
         self.save_settings()
+        self.hide_auxiliary_windows_for_tray()
         self.tray_icon.show()
         self.hide()
         app_log("Minimized to system tray")
@@ -1740,14 +2323,14 @@ class MiniDropPlayer(QWidget):
             pass
 
     def on_tray_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self.show_playlist_window()
+        elif reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.restore_from_tray()
 
     def restore_from_tray(self):
         T("""タスクトレイから通常Playerへ復帰する。""")
         app_log("Restore from system tray")
-        if self.tray_icon is not None:
-            self.tray_icon.hide()
 
         # トレイ復帰時は、必ず通常Playerへ戻す。
         if self.is_one_shot_panel_mode:
@@ -1761,6 +2344,19 @@ class MiniDropPlayer(QWidget):
         self.raise_()
         self.activateWindow()
         self.save_settings()
+
+    def hide_auxiliary_windows_for_tray(self):
+        try:
+            if self.log_window.isVisible():
+                self.log_window.hide()
+        except Exception:
+            pass
+        playlist_window = getattr(self, "playlist_window", None)
+        if playlist_window is not None:
+            try:
+                playlist_window.hide()
+            except Exception:
+                pass
 
     def build_ui(self):
         app_log("Build UI")
@@ -2143,14 +2739,10 @@ class MiniDropPlayer(QWidget):
         self.small_control_layout.addWidget(self.small_subtitle_font_button)
         self.small_control_layout.addWidget(self.small_one_shot_button)
 
-        self.current_time_label = QLabel("0:00")
-        self.current_time_label.setMinimumWidth(48)
+        self.current_time_label = TimeDisplayLabel("0:00")
         self.current_time_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.current_time_label.setStyleSheet("color:#d0d0d0;font-size:12px;")
-        self.total_time_label = QLabel("0:00")
-        self.total_time_label.setMinimumWidth(48)
+        self.total_time_label = TimeDisplayLabel("0:00")
         self.total_time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.total_time_label.setStyleSheet("color:#d0d0d0;font-size:12px;")
         self.position_slider = QSlider(Qt.Horizontal)
         self.position_slider.setToolTip(T("ドラッグして再生位置を移動します"))
         self.position_slider.setRange(0, 0)
@@ -2238,8 +2830,8 @@ class MiniDropPlayer(QWidget):
         self.small_seek_forward_button.clicked.connect(self.seek_forward_10s)
         self.next_button.clicked.connect(lambda: self.play_next())
         self.small_next_button.clicked.connect(lambda: self.play_next())
-        self.gear_button.clicked.connect(self.show_gear_menu)
-        self.help_button.clicked.connect(self.show_help_menu)
+        self.gear_button.clicked.connect(lambda _checked=False: self.show_gear_menu())
+        self.help_button.clicked.connect(lambda _checked=False: self.show_help_menu())
         self.subtitle_toggle_button.clicked.connect(self.toggle_subtitle_panel_from_header)
         self.subtitle_font_button.clicked.connect(self.open_subtitle_font_dialog)
         self.small_subtitle_font_button.clicked.connect(self.open_subtitle_font_dialog)
@@ -2263,6 +2855,8 @@ class MiniDropPlayer(QWidget):
         self.left_list.itemContextRequested.connect(self.show_left_playlist_item_menu)
         self.left_list.fontWheelChanged.connect(self.on_playlist_font_wheel_changed)
         self.title_label.fontWheelChanged.connect(self.on_title_font_wheel_changed)
+        self.current_time_label.wheelChanged.connect(self.on_time_font_wheel_changed)
+        self.total_time_label.wheelChanged.connect(self.on_time_font_wheel_changed)
         self.random_art_timer.timeout.connect(self.show_random_playlist_art)
         self.random_art_delay_timer.timeout.connect(self.start_random_art_mode)
         self.random_check.toggled.connect(self.on_random_art_check_toggled)
@@ -2282,9 +2876,53 @@ class MiniDropPlayer(QWidget):
         self.player.playbackStateChanged.connect(self.on_state_changed)
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.errorOccurred.connect(self.on_player_error)
+        self.media_devices.audioOutputsChanged.connect(self.on_audio_outputs_changed)
         self.position_slider.sliderPressed.connect(self.on_seek_start)
         self.position_slider.sliderReleased.connect(self.on_seek_end)
         self.position_slider.sliderMoved.connect(self.on_seek_move)
+
+    def audio_device_id(self, device) -> bytes:
+        try:
+            raw = device.id()
+            return bytes(raw) if raw is not None else b""
+        except Exception:
+            return b""
+
+    def audio_device_name(self, device) -> str:
+        try:
+            name = str(device.description() or "").strip()
+            return name or "Unknown"
+        except Exception:
+            return "Unknown"
+
+    def on_audio_outputs_changed(self):
+        current_device = self.audio.device()
+        new_default = QMediaDevices.defaultAudioOutput()
+        current_id = self.audio_device_id(current_device)
+        previous_default_id = self.last_known_default_audio_device_id
+        new_default_id = self.audio_device_id(new_default)
+        self.last_known_default_audio_device_id = new_default_id
+
+        if current_id and previous_default_id and current_id != previous_default_id:
+            app_log(
+                "[AUDIO] audio outputs changed; current device is custom/fixed, "
+                f"keep using: {self.audio_device_name(current_device)}"
+            )
+            return
+        if new_default.isNull():
+            app_log("[AUDIO] audio outputs changed; no default output device is available")
+            return
+        if current_id == new_default_id:
+            app_log(f"[AUDIO] default output unchanged: {self.audio_device_name(new_default)}")
+            return
+        try:
+            self.audio.setDevice(new_default)
+            app_log(
+                "[AUDIO] switched output to new system default: "
+                f"{self.audio_device_name(new_default)}"
+            )
+        except Exception as exc:
+            app_log(f"[AUDIO] failed to switch to new default output: {exc}")
 
     def setup_media_shortcuts(self):
         self.media_shortcuts = []
@@ -2386,6 +3024,13 @@ class MiniDropPlayer(QWidget):
             elif path.is_dir():
                 files.extend(self.collect_audio_files(path))
         return files
+
+    def handle_startup_audio_files(self, files: list[Path]):
+        normalized = [Path(p) for p in files if Path(p).exists() and Path(p).is_file() and Path(p).suffix.lower() in AUDIO_EXTS]
+        if not normalized:
+            return
+        app_log(f"Startup audio request detected: {normalized[0]}")
+        self.play_one_shot(normalized[0], enter_panel=False)
 
     def import_playlist_drop_with_dialog(self, files: list[Path]):
         msg = QMessageBox(self)
@@ -2499,6 +3144,7 @@ class MiniDropPlayer(QWidget):
         has_original_art = self.load_album_art(path)
         self.prepare_random_art_for_current_track(has_original_art)
         self.load_subtitles_for(path)
+        self.refresh_playlist_window()
         self.player.play()
         self.save_settings()
 
@@ -2696,9 +3342,10 @@ class MiniDropPlayer(QWidget):
         self.title_label.setText(title)
         self.art_title_label.setText(title)
         self.one_shot_name_label.setText(title)
-        self.setWindowTitle(f"DropMp3 - {title}" if path else "DropMp3")
+        app_title = f"DropMp3 {format_version_label(self.current_app_version)}"
+        self.setWindowTitle(f"{app_title} - {title}" if path else app_title)
         if self.tray_icon is not None:
-            self.tray_icon.setToolTip(f"DropMp3\n{title}" if path else "DropMp3")
+            self.tray_icon.setToolTip(self.build_tray_tooltip())
 
     def update_random_art_pool(self):
         current = self.current_media_path()
@@ -2914,6 +3561,286 @@ class MiniDropPlayer(QWidget):
         except Exception:
             return Path.cwd()
 
+    def release_page_url(self) -> str:
+        return f"https://github.com/{APP_GITHUB_REPO}/releases/latest"
+
+    def schedule_startup_update_check(self):
+        if not getattr(sys, "frozen", False):
+            return
+        self.check_for_app_update(silent=True, manual=False)
+
+    def check_for_app_update(self, silent: bool = False, manual: bool = True):
+        if self.update_check_in_progress:
+            if manual:
+                QMessageBox.information(self, T("更新確認"), T("更新確認を実行中です。"))
+            return
+
+        self.update_check_in_progress = True
+
+        def worker():
+            try:
+                release = fetch_latest_release_metadata()
+                asset = select_release_asset(release)
+                latest_version = normalize_version_text(
+                    str(release.get("tag_name") or release.get("name") or "").strip()
+                )
+                payload = {
+                    "silent": bool(silent),
+                    "manual": bool(manual),
+                    "current_version": self.current_app_version,
+                    "latest_version": latest_version,
+                    "release_url": str(release.get("html_url", "") or self.release_page_url()),
+                    "asset": asset,
+                    "release": release,
+                    "has_update": bool(latest_version) and version_sort_key(latest_version) > version_sort_key(self.current_app_version),
+                }
+                self.update_bridge.checkFinished.emit(payload)
+            except Exception as exc:
+                self.update_bridge.updateError.emit(
+                    {
+                        "title": T("更新確認"),
+                        "message": T("更新確認に失敗しました。\n\n") + str(exc),
+                        "silent": bool(silent),
+                    }
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_update_check_finished(self, payload: dict):
+        self.update_check_in_progress = False
+        latest_version = str(payload.get("latest_version", "") or "").strip()
+        manual = bool(payload.get("manual"))
+        silent = bool(payload.get("silent"))
+        if not latest_version:
+            if manual and not silent:
+                QMessageBox.information(self, T("更新確認"), T("最新版を確認できませんでした。"))
+            return
+        if not payload.get("has_update"):
+            if manual and not silent:
+                QMessageBox.information(self, T("更新確認"), T("最新版です。"))
+            return
+
+        release_url = str(payload.get("release_url", "") or self.release_page_url())
+        current_version = str(payload.get("current_version", self.current_app_version) or self.current_app_version)
+        text = (
+            T("最新版があります。\n\n現在: ")
+            + current_version
+            + T("\n最新版: ")
+            + latest_version
+            + T("\n\n今すぐダウンロードして更新しますか？")
+        )
+
+        if not getattr(sys, "frozen", False):
+            answer = QMessageBox.question(
+                self,
+                T("更新"),
+                text + "\n\n" + T("この実行形態では自動更新できません。Release ページを開きますか？"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                QDesktopServices.openUrl(QUrl(release_url))
+            return
+
+        if payload.get("asset") is None:
+            answer = QMessageBox.question(
+                self,
+                T("更新"),
+                text + "\n\n" + T("配布アセットが見つかりませんでした。"),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.Yes:
+                QDesktopServices.openUrl(QUrl(release_url))
+            return
+
+        answer = QMessageBox.question(
+            self,
+            T("更新"),
+            text,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self.download_release_update(payload)
+
+    def download_release_update(self, payload: dict):
+        if self.update_download_in_progress:
+            QMessageBox.information(self, T("更新"), T("ダウンロード中..."))
+            return
+
+        asset = payload.get("asset") or {}
+        url = str(asset.get("browser_download_url", "") or "")
+        name = str(asset.get("name", "") or "dropmp3_update.zip")
+        if not url:
+            QMessageBox.warning(self, T("ダウンロード失敗"), T("配布アセットが見つかりませんでした。"))
+            return
+
+        self.update_download_in_progress = True
+        self.update_download_context = dict(payload)
+        self.update_progress_dialog = QProgressDialog(T("ダウンロード中..."), T("中止"), 0, 100, self)
+        self.update_progress_dialog.setWindowTitle(T("更新"))
+        self.update_progress_dialog.setAutoClose(False)
+        self.update_progress_dialog.setAutoReset(False)
+        self.update_progress_dialog.setMinimumDuration(0)
+        self.update_progress_dialog.setValue(0)
+        self.update_progress_dialog.setCancelButton(None)
+        self.update_progress_dialog.show()
+
+        def worker():
+            temp_dir = Path(tempfile.mkdtemp(prefix="dropmp3_update_"))
+            target_path = temp_dir / name
+            digest_value = str(asset.get("digest", "") or "").strip()
+            expected_sha256 = ""
+            if digest_value.lower().startswith("sha256:"):
+                expected_sha256 = digest_value.split(":", 1)[1].strip().lower()
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": f"{APP_NAME}-updater",
+                        "Accept": "application/octet-stream",
+                    },
+                )
+                sha256 = hashlib.sha256()
+                with urllib.request.urlopen(req, timeout=APP_UPDATE_TIMEOUT_SEC) as resp, target_path.open("wb") as out_file:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                    downloaded = 0
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+                        sha256.update(chunk)
+                        downloaded += len(chunk)
+                        percent = int(downloaded * 100 / total) if total > 0 else 0
+                        self.update_bridge.progressChanged.emit(percent, f"{downloaded}/{total}" if total > 0 else str(downloaded))
+                if expected_sha256 and sha256.hexdigest().lower() != expected_sha256:
+                    raise RuntimeError("SHA-256 mismatch")
+                result = dict(payload)
+                result["download_path"] = str(target_path)
+                self.update_bridge.downloadFinished.emit(result)
+            except Exception as exc:
+                self.update_bridge.updateError.emit(
+                    {
+                        "title": T("ダウンロード失敗"),
+                        "message": str(exc),
+                        "silent": False,
+                    }
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_update_download_progress(self, percent: int, detail: str):
+        dialog = self.update_progress_dialog
+        if dialog is None:
+            return
+        dialog.setLabelText(f"{T('ダウンロード中...')}\n{detail}")
+        if percent > 0:
+            dialog.setValue(max(0, min(100, int(percent))))
+
+    def on_update_download_finished(self, payload: dict):
+        self.update_download_in_progress = False
+        dialog = self.update_progress_dialog
+        self.update_progress_dialog = None
+        if dialog is not None:
+            dialog.setValue(100)
+            dialog.close()
+        self.update_download_context = dict(payload)
+
+        message = (
+            T("更新用ファイルのダウンロードが完了しました。\n\n今すぐアプリを終了して更新を適用しますか？")
+            + "\n\n"
+            + T("起動中の EXE を置き換えるため、アプリを一度終了してから更新します。設定とプレイリストは保持します。")
+        )
+        answer = QMessageBox.question(
+            self,
+            T("ダウンロード完了"),
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self.launch_downloaded_update(payload)
+
+    def on_update_error(self, payload: dict):
+        self.update_check_in_progress = False
+        self.update_download_in_progress = False
+        dialog = self.update_progress_dialog
+        self.update_progress_dialog = None
+        if dialog is not None:
+            dialog.close()
+        if payload.get("silent"):
+            app_log(f"[UPDATE] {payload.get('title', 'error')}: {payload.get('message', '')}")
+            return
+        QMessageBox.warning(self, str(payload.get("title", "") or T("更新エラー")), str(payload.get("message", "") or ""))
+
+    def launch_downloaded_update(self, payload: dict):
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(self, T("更新"), T("この実行形態では自動更新できません。Release ページを開きますか？"))
+            return
+        download_path = Path(str(payload.get("download_path", "") or ""))
+        if not download_path.exists():
+            QMessageBox.warning(self, T("更新エラー"), T("更新を開始できませんでした。\n\n") + str(download_path))
+            return
+
+        script_path = download_path.with_suffix(".ps1")
+        app_dir = self.app_base_dir()
+        exe_path = Path(sys.executable).resolve()
+        script_text = f"""$ErrorActionPreference = 'Stop'
+$zipPath = {str(download_path)!r}
+$appDir = {str(app_dir)!r}
+$exePath = {str(exe_path)!r}
+$parentPid = {int(os.getpid())}
+for ($i = 0; $i -lt 600; $i++) {{
+    $proc = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+    if (-not $proc) {{ break }}
+    Start-Sleep -Milliseconds 500
+}}
+$extractRoot = Join-Path ([System.IO.Path]::GetDirectoryName($zipPath)) ('dropmp3_apply_' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
+Expand-Archive -LiteralPath $zipPath -DestinationPath $extractRoot -Force
+$payloadRoot = $extractRoot
+$exeCandidate = Get-ChildItem -LiteralPath $extractRoot -Filter 'DropMP3.exe' -File -Recurse | Select-Object -First 1
+if ($exeCandidate) {{ $payloadRoot = $exeCandidate.Directory.FullName }}
+Get-ChildItem -LiteralPath $payloadRoot -Force -Recurse | ForEach-Object {{
+    $relative = [System.IO.Path]::GetRelativePath($payloadRoot, $_.FullName)
+    if ([string]::IsNullOrWhiteSpace($relative)) {{ return }}
+    if ($relative -ieq '_conf\\DropMp3.ini') {{ return }}
+    if ($relative -like '_conf\\lst*') {{ return }}
+    if ($relative -like '_conf\\srt*') {{ return }}
+    $destination = Join-Path $appDir $relative
+    if ($_.PSIsContainer) {{
+        New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    }} else {{
+        $destDir = Split-Path -Parent $destination
+        if ($destDir) {{ New-Item -ItemType Directory -Force -Path $destDir | Out-Null }}
+        Copy-Item -LiteralPath $_.FullName -Destination $destination -Force
+    }}
+}}
+Start-Sleep -Milliseconds 300
+Start-Process -FilePath $exePath
+"""
+        try:
+            script_path.write_text(script_text, encoding="utf-8")
+            ok = QProcess.startDetached(
+                "powershell.exe",
+                [
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script_path),
+                ],
+            )
+            if not ok:
+                raise RuntimeError("startDetached failed")
+            self.shutdown_remote_control()
+            self.save_settings()
+            QApplication.quit()
+        except Exception as exc:
+            QMessageBox.warning(self, T("更新エラー"), T("更新を開始できませんでした。\n\n") + str(exc))
+
     def subtitle_file_candidates(self, path: Path, suffix: str) -> list[Path]:
         path = Path(path)
         app_dir = self.app_base_dir()
@@ -3070,11 +3997,13 @@ class MiniDropPlayer(QWidget):
         try:
             self.subtitle_primary_cues = parse_srt(srt_path) if srt_path else []
             self.subtitle_secondary_cues = parse_srt(srt2_path) if srt2_path else []
-            if self.subtitle_display_mode == 2 and not self.subtitle_secondary_cues:
-                self.subtitle_display_mode = 1 if self.subtitle_primary_cues else 0
-            elif self.subtitle_display_mode == 1 and not self.subtitle_primary_cues:
-                self.subtitle_display_mode = 2 if self.subtitle_secondary_cues else 0
-            elif self.subtitle_display_mode == 0:
+            modes = self.subtitle_available_modes()
+            if self.subtitle_auto_show_enabled and modes:
+                if self.subtitle_display_mode not in modes:
+                    self.subtitle_display_mode = modes[0]
+                self.subtitles_manually_hidden = False
+            else:
+                self.subtitle_display_mode = 0
                 self.subtitles_manually_hidden = True
             self.apply_active_subtitle_mode()
             self.update_subtitle_controls()
@@ -3109,6 +4038,23 @@ class MiniDropPlayer(QWidget):
         if modes == [2]:
             return T("字幕表示: .srt2 を表示 / 非表示")
         return T("字幕表示: オフ → .srt → .srt2 を切り替えます")
+
+    def set_subtitle_auto_show_enabled(self, checked: bool):
+        self.subtitle_auto_show_enabled = bool(checked)
+        app_log(f"Subtitle auto show: {'ON' if self.subtitle_auto_show_enabled else 'OFF'}")
+        current = self.current_media_path()
+        if current is not None and (self.subtitle_primary_cues or self.subtitle_secondary_cues):
+            modes = self.subtitle_available_modes()
+            if self.subtitle_auto_show_enabled and modes:
+                self.subtitle_display_mode = modes[0]
+                self.subtitles_manually_hidden = False
+            else:
+                self.subtitle_display_mode = 0
+                self.subtitles_manually_hidden = True
+            self.apply_active_subtitle_mode()
+            self.subtitle_overlay.update_position(self.player.position())
+            self.update_subtitle_controls()
+        self.save_settings()
 
     def apply_active_subtitle_mode(self):
         mode = self.subtitle_display_mode
@@ -3334,6 +4280,20 @@ class MiniDropPlayer(QWidget):
         app_log(f"Volume label font size changed by wheel: {self.volume_font_size}px")
         self.save_settings()
 
+    def change_time_font_size_by_wheel(self, delta: int, event=None, owner=None):
+        step_count = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
+        self.time_font_size = max(8, min(28, int(self.time_font_size) + step_count))
+        for label in (self.current_time_label, self.total_time_label):
+            label.set_display_font_size(self.time_font_size)
+        widget = owner or self.current_time_label
+        if event is not None and hasattr(event, "globalPosition"):
+            tip_pos = event.globalPosition().toPoint() + QPoint(22, 0)
+        else:
+            tip_pos = widget.mapToGlobal(QPoint(widget.width() + 8, int(widget.height() / 2)))
+        QToolTip.showText(tip_pos, f"時間文字サイズ {self.time_font_size}px", widget)
+        app_log(f"Time label font size changed by wheel: {self.time_font_size}px")
+        self.save_settings()
+
     def change_title_font_size_by_wheel(self, delta: int, event=None):
         step_count = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
         self.title_font_size = max(16, min(72, int(self.title_font_size) + step_count))
@@ -3454,6 +4414,9 @@ class MiniDropPlayer(QWidget):
 
     def on_title_font_wheel_changed(self, delta: int, event):
         self.change_title_font_size_by_wheel(delta, event)
+
+    def on_time_font_wheel_changed(self, delta: int, event):
+        self.change_time_font_size_by_wheel(delta, event, self.sender())
 
     def eventFilter(self, obj, event):
         if (
@@ -3887,6 +4850,7 @@ class MiniDropPlayer(QWidget):
             self.left_list.scrollToItem(self.left_list.item(view_row), QAbstractItemView.PositionAtCenter)
         self.left_list.blockSignals(old_block)
         self.update_playlist_footer()
+        self.refresh_playlist_window()
 
     def update_playlist_footer(self):
         if hasattr(self, "playlist_footer_label"):
@@ -3923,7 +4887,7 @@ class MiniDropPlayer(QWidget):
             self.apply_subtitle_style(old_font, old_color)
             app_log("Subtitle font change canceled")
 
-    def show_gear_menu(self):
+    def show_gear_menu(self, global_pos: QPoint | None = None):
         menu = QMenu(self)
         menu.setStyleSheet(self.menu_style())
 
@@ -3964,21 +4928,32 @@ class MiniDropPlayer(QWidget):
             repeat_menu.addAction(act)
 
         menu.addSeparator()
+        subtitle_auto_show_action = QAction(T("字幕を表示する"), self)
+        subtitle_auto_show_action.setCheckable(True)
+        subtitle_auto_show_action.setChecked(bool(self.subtitle_auto_show_enabled))
+        subtitle_auto_show_action.triggered.connect(self.set_subtitle_auto_show_enabled)
+        menu.addAction(subtitle_auto_show_action)
+
+        menu.addSeparator()
         log_action = QAction(T("ログウィンドウを表示 / 非表示  F12"), self)
         log_action.triggered.connect(self.toggle_log_window)
         menu.addAction(log_action)
+        update_action = QAction(T("GitHub Release の更新確認"), self)
+        update_action.triggered.connect(lambda _checked=False: self.check_for_app_update(silent=False, manual=True))
+        menu.addAction(update_action)
 
-        menu.exec(self.gear_button.mapToGlobal(self.gear_button.rect().bottomLeft()))
+        pos = global_pos if global_pos is not None else self.gear_button.mapToGlobal(self.gear_button.rect().bottomLeft())
+        menu.exec(pos)
 
     def help_label(self, ja: str, en: str) -> str:
         return ja if APP_UI_LANGUAGE == "ja" else en
 
-    def show_help_menu(self):
+    def show_help_menu(self, global_pos: QPoint | None = None):
         menu = QMenu(self)
         menu.setStyleSheet(self.menu_style())
 
         about_action = QAction(self.help_label("DropMp3について", "About DropMp3"), self)
-        about_action.triggered.connect(lambda checked=False: self.open_help_page("about"))
+        about_action.triggered.connect(lambda checked=False: self.show_about_dialog())
         menu.addAction(about_action)
 
         operation_action = QAction(self.help_label("操作方法", "Operation Guide"), self)
@@ -3989,7 +4964,171 @@ class MiniDropPlayer(QWidget):
         install_action.triggered.connect(lambda checked=False: self.open_help_page("install"))
         menu.addAction(install_action)
 
-        menu.exec(self.help_button.mapToGlobal(self.help_button.rect().bottomLeft()))
+        pos = global_pos if global_pos is not None else self.help_button.mapToGlobal(self.help_button.rect().bottomLeft())
+        menu.exec(pos)
+
+    def position_dialog_above_tray(self, dialog: QDialog):
+        tray_icon = getattr(self, "tray_icon", None)
+        if tray_icon is not None:
+            try:
+                tray_geo = tray_icon.geometry()
+                if tray_geo.isValid():
+                    target = QPoint(
+                        tray_geo.center().x() - int(dialog.width() / 2),
+                        tray_geo.top() - dialog.height() - 12,
+                    )
+                    screen = QApplication.screenAt(tray_geo.center()) or QApplication.primaryScreen()
+                    if screen is not None:
+                        available = screen.availableGeometry()
+                        target.setX(max(available.left() + 8, min(target.x(), available.right() - dialog.width() - 8)))
+                        target.setY(max(available.top() + 8, min(target.y(), available.bottom() - dialog.height() - 8)))
+                    dialog.move(target)
+                    return
+            except Exception as exc:
+                app_log(f"[ABOUT] tray position failed: {exc}")
+        fallback = QCursor.pos()
+        dialog.move(fallback.x() - int(dialog.width() / 2), fallback.y() - dialog.height() - 16)
+
+    def show_about_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.help_label("DropMp3について", "About DropMp3"))
+        dialog.setModal(False)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.setWindowFlag(Qt.WindowType.Tool, True)
+        dialog.setStyleSheet("""
+            QDialog { background:#171717; color:#f3f3f3; border:1px solid #2f6fb6; }
+            QLabel { color:#f3f3f3; }
+            QLabel#aboutTitle { font-size:24px; font-weight:700; color:#ffffff; }
+            QLabel#aboutBody { font-size:13px; line-height:1.5; }
+            QPushButton {
+                background:#2b2b2b; color:#f0f0f0; border:1px solid #5f6d7f;
+                border-radius:5px; padding:7px 18px; min-width:84px;
+            }
+            QPushButton:hover { background:#234c7a; border-color:#59a7ff; }
+        """)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 12)
+        layout.setSpacing(10)
+
+        header = QLabel(self.help_label("DropMp3について", "About DropMp3"))
+        header.setObjectName("aboutTitle")
+        layout.addWidget(header)
+
+        body_layout = QHBoxLayout()
+        body_layout.setSpacing(14)
+
+        image_label = QLabel()
+        image_label.setFixedSize(180, 180)
+        image_label.setAlignment(Qt.AlignCenter)
+        image_path = self.about_image_path()
+        if image_path is not None:
+            pixmap = QPixmap(str(image_path))
+            if not pixmap.isNull():
+                image_label.setPixmap(pixmap.scaled(180, 180, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        body_layout.addWidget(image_label)
+
+        text_browser = QTextBrowser()
+        text_browser.setOpenExternalLinks(True)
+        text_browser.setFrameShape(QFrame.NoFrame)
+        text_browser.setStyleSheet("background:transparent; border:none; color:#f3f3f3;")
+        version_label = format_version_label(self.current_app_version)
+        github_url = f"https://github.com/{APP_GITHUB_REPO}/"
+        text_browser.setHtml(
+            f"""
+            <div style="font-size:13px; color:#f3f3f3;">
+              <div style="font-size:22px; font-weight:700; color:#ffffff; margin-bottom:10px;">DropMp3 {version_label}</div>
+              <div style="margin-bottom:12px;">音声ファイルをドラッグ&ドロップして再生できる、常駐型のミニプレイヤーです。</div>
+              <div style="margin-bottom:12px;">GitHub: <a href="{github_url}" style="color:#7db7ff;">{github_url}</a></div>
+              <div style="margin-bottom:12px;">トレイ左クリック: プレイリスト表示<br>トレイ左ダブルクリック: Player表示<br>トレイ右クリック: メニュー表示</div>
+              <div>現在曲: {escape(self.current_track_tooltip_text())}</div>
+            </div>
+            """
+        )
+        body_layout.addWidget(text_browser, 1)
+
+        layout.addLayout(body_layout)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(dialog.close)
+        button_row.addWidget(ok_button)
+        layout.addLayout(button_row)
+
+        dialog.resize(700, 360)
+        self.position_dialog_above_tray(dialog)
+        self.help_dialogs.append(dialog)
+        dialog.destroyed.connect(lambda *_: self.help_dialogs.remove(dialog) if dialog in self.help_dialogs else None)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def show_playlist_window(self):
+        if self.playlist_window is None:
+            dialog = QDialog(None)
+            dialog.setWindowTitle(T("プレイリスト表示"))
+            dialog.setModal(False)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+            dialog.setWindowFlag(Qt.WindowType.Tool, True)
+            dialog.setStyleSheet("""
+                QDialog{background:#181818;color:#eeeeee;}
+                QListWidget{background:#101010;color:#eeeeee;border:1px solid #333;outline:none;}
+                QListWidget::item{padding:6px;border-bottom:1px solid #242424;}
+                QListWidget::item:selected{background:#2d4a35;color:#fff;}
+                QLabel{color:#dfffe7;font-weight:bold;}
+                QPushButton{background:#2b2b2b;color:#fff;border:1px solid #666;border-radius:5px;padding:6px 16px;}
+                QPushButton:hover{background:#1d3828;border-color:#41db78;}
+            """)
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(8)
+            title = QLabel(T("現在の再生リスト"))
+            layout.addWidget(title)
+            list_widget = QListWidget()
+            list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+            list_widget.itemDoubleClicked.connect(lambda item: self.play_playlist_window_index(int(item.data(Qt.UserRole))))
+            layout.addWidget(list_widget, 1)
+            close_button = QPushButton(T("閉じる"))
+            close_button.clicked.connect(dialog.hide)
+            layout.addWidget(close_button, alignment=Qt.AlignRight)
+            dialog.resize(560, 520)
+            self.playlist_window = dialog
+            self.playlist_window_list = list_widget
+        self.refresh_playlist_window()
+        self.playlist_window.show()
+        self.playlist_window.raise_()
+        self.playlist_window.activateWindow()
+
+    def play_playlist_window_index(self, index: int):
+        if 0 <= index < len(self.playlist):
+            self.play_index(index, autoplay=True)
+            if self.playlist_window is not None:
+                self.playlist_window.raise_()
+
+    def refresh_playlist_window(self):
+        list_widget = getattr(self, "playlist_window_list", None)
+        if list_widget is None:
+            return
+        list_widget.clear()
+        if not self.playlist:
+            empty = QListWidgetItem(T("曲がありません"))
+            empty.setFlags(Qt.NoItemFlags)
+            list_widget.addItem(empty)
+            return
+        current_row = -1
+        for i, path in enumerate(self.playlist):
+            prefix = "▶ " if i == self.current_index and self.one_shot_path is None else "   "
+            item = QListWidgetItem(f"{prefix}{i + 1:02d}. {self.get_display_title(path)}")
+            item.setData(Qt.UserRole, i)
+            item.setToolTip(str(path))
+            if i == self.current_index and self.one_shot_path is None:
+                item.setForeground(QColor("#ff9b45"))
+                current_row = i
+            list_widget.addItem(item)
+        if current_row >= 0:
+            list_widget.setCurrentRow(current_row)
+            list_widget.scrollToItem(list_widget.item(current_row), QAbstractItemView.PositionAtCenter)
 
     def help_path_for(self, page_key: str) -> Path:
         lang = "ja" if APP_UI_LANGUAGE == "ja" else "en"
@@ -5263,7 +6402,11 @@ class MiniDropPlayer(QWidget):
 
     def exit_application(self):
         app_log("Exit selected")
+        self.exit_requested = True
+        self.shutdown_remote_control()
         self.save_settings()
+        if self.tray_icon is not None:
+            self.tray_icon.hide()
         QApplication.quit()
 
     def clear_playlist(self):
@@ -5350,12 +6493,14 @@ class MiniDropPlayer(QWidget):
         self.settings.setValue("random_art_enabled", self.random_art_enabled)
         self.settings.setValue("subtitle/font", self.subtitle_font.toString())
         self.settings.setValue("subtitle/color", self.subtitle_color.name())
+        self.settings.setValue("subtitle/auto_show", self.subtitle_auto_show_enabled)
         self.settings.setValue("subtitle/source_language", self.subtitle_source_language)
         self.settings.setValue("subtitle/target_language", self.subtitle_target_language)
         self.settings.setValue("subtitle/ollama_model", self.ollama_model)
         self.settings.setValue("drawer_open", self.drawer_open)
         self.settings.setValue("playlist_font_size", int(self.playlist_font_size))
         self.settings.setValue("volume_font_size", int(self.volume_font_size))
+        self.settings.setValue("time_font_size", int(self.time_font_size))
         self.settings.setValue("title_font_size", int(self.title_font_size))
         self.settings.setValue("control_icon_scale", float(self.control_icon_scale))
         self.settings.setValue("playlist_order_mode", self.playlist_order_mode)
@@ -5424,6 +6569,10 @@ class MiniDropPlayer(QWidget):
         except Exception:
             self.volume_font_size = 12
         try:
+            self.time_font_size = max(8, min(28, int(self.settings.value("time_font_size", self.time_font_size))))
+        except Exception:
+            self.time_font_size = 12
+        try:
             self.title_font_size = max(16, min(72, int(self.settings.value("title_font_size", self.title_font_size))))
         except Exception:
             self.title_font_size = 28
@@ -5440,6 +6589,9 @@ class MiniDropPlayer(QWidget):
         self.apply_control_icon_scale()
         if hasattr(self, "volume_label"):
             self.volume_label.set_display_font_size(self.volume_font_size)
+        if hasattr(self, "current_time_label") and hasattr(self, "total_time_label"):
+            self.current_time_label.set_display_font_size(self.time_font_size)
+            self.total_time_label.set_display_font_size(self.time_font_size)
         self.update_startup_splash("字幕設定を読み込み中...", 78)
         font_str = self.settings.value("subtitle/font", "")
         if font_str:
@@ -5450,6 +6602,7 @@ class MiniDropPlayer(QWidget):
         color = QColor(str(color_str))
         if color.isValid():
             self.subtitle_color = color
+        self.subtitle_auto_show_enabled = bool_from_settings(self.settings.value("subtitle/auto_show", True), True)
         self.subtitle_source_language = str(self.settings.value("subtitle/source_language", self.subtitle_source_language) or "auto")
         self.subtitle_target_language = str(self.settings.value("subtitle/target_language", self.subtitle_target_language) or "ja")
         self.ollama_model = str(self.settings.value("subtitle/ollama_model", self.ollama_model) or "llama3.1")
@@ -5502,6 +6655,157 @@ class MiniDropPlayer(QWidget):
         if bool_from_settings(self.settings.value("log_visible", False), False):
             self.log_window.show()
 
+
+    def setup_remote_control(self):
+        self.remote_server = RemoteControlServer(self, "DropMp3", 8765)
+        self.remote_server.start()
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.aboutToQuit.connect(self.shutdown_remote_control)
+            except Exception:
+                pass
+
+    def shutdown_remote_control(self):
+        server = getattr(self, "remote_server", None)
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception as exc:
+                app_log(f"[REMOTE] shutdown skipped: {exc}")
+            self.remote_server = None
+
+    def open_remote_control_url(self):
+        server = getattr(self, "remote_server", None)
+        url = getattr(server, "url", "") or "http://127.0.0.1:8765/"
+        app_log(f"[REMOTE] open remote control URL: {url}")
+        QDesktopServices.openUrl(QUrl(url))
+
+    def remote_state_text(self) -> str:
+        state = self.player.playbackState()
+        if state == QMediaPlayer.PlayingState:
+            return T("再生中")
+        if state == QMediaPlayer.PausedState:
+            return T("一時停止")
+        return T("停止")
+
+    def remote_playlist_payload(self) -> dict:
+        items = []
+        for index, media in enumerate(self.playlist):
+            try:
+                title = self.get_display_title(media)
+            except Exception:
+                title = Path(media).stem
+            items.append({
+                "index": index,
+                "title": str(title),
+                "path": str(media),
+                "current": bool(index == self.current_index and self.one_shot_path is None),
+                "exists": bool(Path(media).exists()),
+            })
+        return {"ok": True, "count": len(items), "items": items}
+
+    def remote_status_payload(self) -> dict:
+        current = self.current_media_path()
+        try:
+            title = self.get_display_title(current) if current is not None else ""
+        except Exception:
+            title = Path(current).stem if current is not None else ""
+        state = self.player.playbackState()
+        if state == QMediaPlayer.PlayingState:
+            state_key = "playing"
+        elif state == QMediaPlayer.PausedState:
+            state_key = "paused"
+        else:
+            state_key = "stopped"
+        return {
+            "ok": True,
+            "app": "DropMp3",
+            "state": state_key,
+            "state_text": self.remote_state_text(),
+            "index": int(self.current_index),
+            "count": len(self.playlist),
+            "title": str(title),
+            "path": str(current or ""),
+            "position_ms": int(self.player.position() or 0),
+            "duration_ms": int(self.player.duration() or 0),
+            "volume": float(self.audio.volume()),
+            "remote_url": getattr(getattr(self, "remote_server", None), "url", ""),
+        }
+
+    def remote_set_position(self, ms: int):
+        duration = max(0, int(self.player.duration() or 0))
+        target = max(0, int(ms or 0))
+        if duration > 0:
+            target = min(target, duration)
+        self.player.setPosition(target)
+        if hasattr(self, "position_slider"):
+            self.position_slider.setValue(target)
+        if hasattr(self, "current_time_label"):
+            self.current_time_label.setText(format_ms(target))
+        self.update_small_time_label(target, duration)
+        if hasattr(self, "subtitle_overlay"):
+            self.subtitle_overlay.update_position(target)
+        self.save_settings()
+
+    def remote_set_volume(self, value):
+        vol = float(value)
+        if vol > 1.0:
+            vol = vol / 100.0
+        vol = max(0.0, min(1.0, vol))
+        self.audio.setVolume(vol)
+        self.update_volume_label()
+        self.save_settings()
+
+    def remote_handle_command(self, command: str, params: dict) -> dict:
+        command = str(command or "").strip().lower()
+        params = dict(params or {})
+        if command == "status":
+            return self.remote_status_payload()
+        if command == "playlist":
+            return self.remote_playlist_payload()
+        if command == "play":
+            raw_index = params.get("index", "")
+            if str(raw_index).strip() != "":
+                self.play_index(int(raw_index), autoplay=True)
+            elif self.current_index < 0 and self.playlist and self.one_shot_path is None:
+                self.play_index(0, autoplay=True)
+            else:
+                self.player.play()
+            return self.remote_status_payload()
+        if command == "pause":
+            self.player.pause()
+            return self.remote_status_payload()
+        if command == "stop":
+            self.player.stop()
+            return self.remote_status_payload()
+        if command == "toggle":
+            self.toggle_play()
+            return self.remote_status_payload()
+        if command == "next":
+            self.play_next()
+            return self.remote_status_payload()
+        if command == "prev":
+            self.play_prev()
+            return self.remote_status_payload()
+        if command == "seek":
+            self.remote_set_position(int(float(params.get("ms", params.get("value", 0)) or 0)))
+            return self.remote_status_payload()
+        if command == "volume":
+            self.remote_set_volume(params.get("value", params.get("volume", 0)))
+            return self.remote_status_payload()
+        if command == "oneshot":
+            raw_path = str(params.get("path", "") or "").strip()
+            path = Path(raw_path) if raw_path else None
+            if path is None or not path.exists() or path.suffix.lower() not in AUDIO_EXTS:
+                return {"ok": False, "error": f"invalid path: {raw_path}"}
+            self.play_one_shot(path, enter_panel=False)
+            return self.remote_status_payload()
+        if command == "show":
+            self.restore_from_tray()
+            return self.remote_status_payload()
+        return {"ok": False, "error": f"unknown command: {command}"}
+
     def changeEvent(self, event):
         T("""通常Playerの最小化ボタンが押されたら、タスクトレイへ格納する。""")
         super().changeEvent(event)
@@ -5516,33 +6820,38 @@ class MiniDropPlayer(QWidget):
             app_log(f"[WINDOW] changeEvent minimize-to-tray failed: {e}")
 
     def closeEvent(self, event):
-        """Close button means real application exit.
+        """Close button hides the player and keeps the tray resident alive."""
+        if not self.exit_requested:
+            app_log("Window close intercepted: keep app resident in tray")
+            event.ignore()
+            self.minimize_to_tray()
+            return
 
-        QApplication.setQuitOnLastWindowClosed(False) is required so playback can
-        continue while the window is hidden in the system tray.  Because of that,
-        simply accepting the window close event does not stop the Qt event loop.
-        Explicitly stop playback and quit the application here.
-        """
-        app_log("Application closing by window close button")
+        app_log("Application closing by explicit exit")
+        self.shutdown_remote_control()
         self.save_settings()
         try:
             self.stop_random_art_mode(hide_notice=True)
             self.player.stop()
-            app_log("Player stopped by window close")
+            app_log("Player stopped by explicit exit")
         except Exception as e:
             app_log(f"[CLOSE] player.stop failed: {e}")
         if self.tray_icon is not None:
             self.tray_icon.hide()
         try:
-            self.log_window.hide()
+            self.hide_auxiliary_windows_for_tray()
             self.log_window.close()
         except Exception:
             pass
         event.accept()
-        QTimer.singleShot(0, QApplication.quit)
 
 
 def main():
+    startup_audio_files = collect_startup_audio_files(sys.argv[1:])
+    if startup_audio_files and try_forward_one_shot_to_existing_instance(startup_audio_files):
+        return
+
+    startup_version = read_app_version(Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
     app_log("Application process started")
     app_log(f"Python: {sys.version}")
     app_log(f"Executable: {sys.executable}")
@@ -5556,7 +6865,7 @@ def main():
     app = QApplication(sys.argv)
     # トレイ格納中はウィンドウが非表示でも再生を継続できるようにする。
     app.setQuitOnLastWindowClosed(False)
-    splash = StartupSplash()
+    splash = StartupSplash(startup_version)
     splash.show()
     splash.update_status("起動準備中...", 5)
 
@@ -5573,6 +6882,8 @@ def main():
     w = MiniDropPlayer(splash=splash)
     splash.update_status("メイン画面を表示中...", 98)
     w.show()
+    if startup_audio_files:
+        w.handle_startup_audio_files(startup_audio_files)
     splash.update_status("起動完了", 100)
     QTimer.singleShot(250, splash.close)
     app_log("Main window shown")

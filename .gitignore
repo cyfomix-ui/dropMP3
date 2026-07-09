@@ -58,3 +58,6 @@ Doc/Sample/
 Doc/AIで簡単に作る自分専用のアプリ_DropMp3(1).md
 
 Doc/DropMP3_note_公開用.md
+.pslocal/
+.psctx*
+_backup_manifest.txt
