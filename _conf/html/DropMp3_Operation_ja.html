@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DropMp3 操作方法</title>
+  <style>
+    body{font-family:"Yu Gothic UI",Meiryo,sans-serif;margin:28px;line-height:1.75;color:#e8ece8;background:#101214}
+    h1{color:#62e781}h2{color:#f0fff2;border-left:6px solid #20b15a;padding-left:10px;margin-top:28px}
+    kbd,code{background:#0b0d0e;border:1px solid #303830;border-radius:4px;padding:1px 5px;color:#caffbf}
+  </style>
+</head>
+<body>
+  <h1>DropMp3 操作方法</h1>
+  <h2>再生</h2>
+  <ul>
+    <li>音声ファイル、フォルダ、M3U8/WPLなどを画面へドロップすると、プレイリストへ追加して再生します。</li>
+    <li>アルバムアートをクリックすると再生/一時停止を切り替えます。</li>
+    <li>ホイール操作で音量を変更できます。</li>
+    <li>下部スライダーをドラッグすると再生位置を移動できます。</li>
+  </ul>
+  <h2>プレイリスト</h2>
+  <ul>
+    <li>左の三本線ボタンでプレイリストを開閉します。</li>
+    <li><code>📋</code> ボタンで <code>_conf\lst</code> 内の保存済みプレイリストを選択して読み込めます。</li>
+    <li><code>💾</code> ボタンで日時付きファイル名のプレイリストを保存します。</li>
+    <li><code>🔍</code> ボタンで現在のプレイリストを検索します。空欄で全件表示へ戻ります。</li>
+    <li>リスト項目の右クリックからプロパティ、字幕確認、字幕削除、リストから削除を実行できます。</li>
+  </ul>
+  <h2>再生モード</h2>
+  <ul>
+    <li><code>🔀</code> はシャッフル、<code>📁</code> はファイル名順ソートです。</li>
+    <li><code>🔁</code> は Off、1曲、全曲のリピートを切り替えます。</li>
+    <li><code>🎯</code> はワンショット再生です。リストに追加せず一時的に再生できます。</li>
+  </ul>
+  <h2>字幕</h2>
+  <ul>
+    <li>リスト項目の右クリックから字幕依頼、字幕確認、字幕削除を実行できます。</li>
+    <li>字幕依頼では元言語と字幕変換先を選択できます。Both を選ぶと <code>.srt</code> と <code>.srt2</code> を作成します。</li>
+    <li>字幕アイコンは 表示無し → 第一字幕 → 第二字幕 の順に切り替わります。</li>
+    <li>字幕ファイルは <code>_conf\srt</code> に保存されます。</li>
+    <li>字幕作成には Whisper、翻訳には Ollama、詳細情報には FFmpeg/ffprobe を使用します。</li>
+  </ul>
+</body>
+</html>

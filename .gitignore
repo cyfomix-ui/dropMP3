@@ -8,6 +8,7 @@ venv/
 # Build outputs
 build/
 dist/
+release/
 *.exe
 *.spec
 
@@ -25,6 +26,11 @@ AGENTS.md
 
 # Local config / user data
 _conf/
+!_conf/
+_conf/*
+!_conf/app_version.xml
+!_conf/html/
+!_conf/html/*.html
 *.m3u8
 
 # VSCode Counter

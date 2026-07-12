@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DropMp3 Operation Guide</title>
+  <style>
+    body{font-family:"Segoe UI","Yu Gothic UI",sans-serif;margin:28px;line-height:1.75;color:#e8ece8;background:#101214}
+    h1{color:#62e781}h2{color:#f0fff2;border-left:6px solid #20b15a;padding-left:10px;margin-top:28px}
+    kbd,code{background:#0b0d0e;border:1px solid #303830;border-radius:4px;padding:1px 5px;color:#caffbf}
+  </style>
+</head>
+<body>
+  <h1>DropMp3 Operation Guide</h1>
+  <h2>Playback</h2>
+  <ul>
+    <li>Drop audio files, folders, or M3U8/WPL playlists onto the window to add and play them.</li>
+    <li>Click the album art to toggle play and pause.</li>
+    <li>Use the mouse wheel to adjust volume.</li>
+    <li>Drag the bottom slider to seek.</li>
+  </ul>
+  <h2>Playlist</h2>
+  <ul>
+    <li>Use the side menu button to open or close the playlist.</li>
+    <li>Use <code>📋</code> to choose and load a saved playlist from <code>_conf\lst</code>.</li>
+    <li>Use <code>💾</code> to save a playlist with a timestamped file name.</li>
+    <li>Use <code>🔍</code> to search the current playlist. Leave it blank to show all items again.</li>
+    <li>Right-click playlist items for properties, subtitle checks, subtitle deletion, and removal.</li>
+  </ul>
+  <h2>Playback Modes</h2>
+  <ul>
+    <li><code>🔀</code> shuffles the playlist. <code>📁</code> sorts it by file name.</li>
+    <li><code>🔁</code> cycles repeat mode through Off, One, and All.</li>
+    <li><code>🎯</code> enables one-shot playback without adding the file to the playlist.</li>
+  </ul>
+  <h2>Subtitles</h2>
+  <ul>
+    <li>Right-click a playlist item to request subtitles, check SRT files, or delete subtitles.</li>
+    <li>The subtitle request dialog lets you choose source language and target output. Both creates <code>.srt</code> and <code>.srt2</code>.</li>
+    <li>The subtitle icon cycles through Off, primary subtitle, and secondary subtitle.</li>
+    <li>Subtitle files are saved under <code>_conf\srt</code>.</li>
+    <li>Whisper is used for subtitle creation, Ollama for translation, and FFmpeg/ffprobe for detailed media information.</li>
+  </ul>
+</body>
+</html>

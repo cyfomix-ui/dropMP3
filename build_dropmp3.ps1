@@ -153,7 +153,7 @@ if ($iconPath) { $args += @("--add-data", "$iconPath;.") }
 if ($aboutImagePath) { $args += @("--add-data", "$aboutImagePath;.") }
 if ($splashSource -and (Test-Path -LiteralPath $splashSource)) { $args += @("--add-data", "$splashSource;.") }
 if ($splashPng -and (Test-Path -LiteralPath $splashPng)) { $args += @("--add-data", "$splashPng;.") }
-if (Test-Path -LiteralPath ".\_conf") { $args += @("--add-data", "$((Resolve-Path -LiteralPath '.\_conf').Path);_conf") }
+if (Test-Path -LiteralPath ".\_conf\app_version.xml") { $args += @("--add-data", "$((Resolve-Path -LiteralPath '.\_conf\app_version.xml').Path);_conf") }
 
 $args += @(
     "--collect-all", "PySide6",
@@ -176,8 +176,13 @@ if (Test-Path -LiteralPath $exePath) {
         if (Test-Path -LiteralPath $confOut) {
             Remove-Item -LiteralPath $confOut -Recurse -Force
         }
-        Copy-Item -LiteralPath $confSrc -Destination $confOut -Recurse -Force
-        Write-Host "Runtime config/help copied: $confOut" -ForegroundColor Green
+        New-Item -ItemType Directory -Force -Path $confOut | Out-Null
+        Copy-Item -LiteralPath (Join-Path $confSrc "app_version.xml") -Destination $confOut -Force
+        $htmlSrc = Join-Path $confSrc "html"
+        if (Test-Path -LiteralPath $htmlSrc) {
+            Copy-Item -LiteralPath $htmlSrc -Destination $confOut -Recurse -Force
+        }
+        Write-Host "Runtime version/help copied: $confOut" -ForegroundColor Green
     }
     Write-Host ""
     Write-Host "DONE: $exePath" -ForegroundColor Green

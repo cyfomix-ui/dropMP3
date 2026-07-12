@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DropMp3 Install方法</title>
+  <style>
+    body{font-family:"Yu Gothic UI",Meiryo,sans-serif;margin:28px;line-height:1.7;color:#e8ece8;background:#101214}
+    h1{color:#62e781}h2{color:#f0fff2;border-left:6px solid #20b15a;padding-left:10px;margin-top:28px}
+    code,pre{background:#0b0d0e;border:1px solid #303830;border-radius:4px;color:#caffbf}code{padding:1px 4px}pre{padding:12px;overflow-x:auto}
+    .note{background:#17251c;border:1px solid #2e7d44;padding:10px 14px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h1>DropMp3 Install方法</h1>
+  <p class="note">通常の音楽再生だけなら追加ツールは不要です。字幕作成や詳細情報表示を使う場合だけ、必要なものをインストールしてください。</p>
+  <h2>Python / 必須ライブラリ</h2>
+  <pre>python -m pip install --upgrade pip
+python -m pip install --upgrade PySide6 mutagen pyinstaller</pre>
+  <h2>Whisper</h2>
+  <pre>python -m pip install -U openai-whisper
+whisper --help</pre>
+  <h2>FFmpeg / ffprobe</h2>
+  <pre>winget install Gyan.FFmpeg
+ffmpeg -version
+ffprobe -version</pre>
+  <h2>設定ファイル</h2>
+  <p>設定はレジストリではなく <code>_conf\DropMp3.ini</code> に保存されます。</p>
+  <p>Help HTML は <code>_conf\html</code>、プレイリストは <code>_conf\lst</code> に配置されます。</p>
+  <p>字幕ファイルは <code>_conf\srt</code> に保存されます。Both 指定時は <code>.srt</code> と <code>.srt2</code> を作成します。</p>
+  <pre>[General]
+volume=0.8
+playlist_json=[]</pre>
+</body>
+</html>

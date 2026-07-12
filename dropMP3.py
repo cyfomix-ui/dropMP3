@@ -119,6 +119,22 @@ APP_UPDATE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/l
 APP_UPDATE_TIMEOUT_SEC = 15
 
 
+def app_resource_dir() -> Path:
+    """Return the read-only application directory (EXE directory when frozen)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def app_data_dir() -> Path:
+    """Return the writable per-user data directory for installed builds."""
+    if getattr(sys, "frozen", False):
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / APP_NAME
+    return app_resource_dir() / "_conf"
+
+
 def read_app_version(base_dir: Path | None = None) -> str:
     if base_dir is not None:
         version_path = Path(base_dir) / APP_VERSION_FILE
@@ -1933,7 +1949,7 @@ class MiniDropPlayer(QWidget):
         super().__init__()
         self.startup_splash = splash
         app_log("MiniDropPlayer init start")
-        self.conf_dir = self.app_base_dir() / "_conf"
+        self.conf_dir = app_data_dir()
         self.conf_html_dir = self.conf_dir / "html"
         self.conf_playlist_dir = self.conf_dir / "lst"
         try:
@@ -1942,6 +1958,9 @@ class MiniDropPlayer(QWidget):
             self.conf_playlist_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             app_log(f"[SETTINGS] _conf create failed: {exc}")
+        self.migrate_legacy_user_data()
+        resource_html_dir = self.app_base_dir() / "_conf" / "html"
+        self.conf_html_dir = resource_html_dir if resource_html_dir.exists() else self.conf_html_dir
         self.help_files = {
             "about": {
                 "ja": self.conf_html_dir / "DropMp3_About_ja.html",
@@ -2293,12 +2312,38 @@ class MiniDropPlayer(QWidget):
         menu.addAction(header_action)
         for idx in indices:
             path = self.playlist[idx]
-            prefix = "▶ " if idx == self.current_index and self.one_shot_path is None else "   "
+            is_current = idx == self.current_index and self.one_shot_path is None
+            prefix = "▶ " if is_current else "   "
             title = self.get_display_title(path)
-            action = QAction(f"{prefix}{idx + 1:02d}. {title}", self)
-            action.setToolTip(str(path))
-            action.triggered.connect(lambda checked=False, i=idx: self.play_index(i, autoplay=True))
-            menu.addAction(action)
+            text = f"{prefix}{idx + 1:02d}. {title}"
+            if is_current:
+                button = QPushButton(text)
+                button.setFlat(True)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.setToolTip(str(path))
+                button.setStyleSheet("""
+                    QPushButton {
+                        background: transparent;
+                        border: none;
+                        color: #ff9b45;
+                        text-align: left;
+                        padding: 6px 24px 6px 24px;
+                        font-size: 13px;
+                    }
+                    QPushButton:hover {
+                        background-color: #333333;
+                        color: #ffb36a;
+                    }
+                """)
+                button.clicked.connect(lambda checked=False, i=idx, m=menu: (m.close(), self.play_index(i, autoplay=True)))
+                button_action = QWidgetAction(menu)
+                button_action.setDefaultWidget(button)
+                menu.addAction(button_action)
+            else:
+                action = QAction(text, self)
+                action.setToolTip(str(path))
+                action.triggered.connect(lambda checked=False, i=idx: self.play_index(i, autoplay=True))
+                menu.addAction(action)
 
     def minimize_to_tray(self):
         T("""通常Playerの最小化ボタンなどから、タスクトレイへ格納する。""")
@@ -3572,6 +3617,25 @@ class MiniDropPlayer(QWidget):
         except Exception:
             return Path.cwd()
 
+    def migrate_legacy_user_data(self):
+        """Copy writable data from an older portable/install layout once."""
+        if not getattr(sys, "frozen", False):
+            return
+        legacy = self.app_base_dir() / "_conf"
+        if legacy.resolve() == self.conf_dir.resolve() or not legacy.exists():
+            return
+        for relative in (Path("DropMp3.ini"), Path("lst"), Path("srt")):
+            source = legacy / relative
+            destination = self.conf_dir / relative
+            try:
+                if source.is_file() and not destination.exists():
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+                elif source.is_dir():
+                    shutil.copytree(source, destination, dirs_exist_ok=True)
+            except Exception as exc:
+                app_log(f"[SETTINGS] legacy migration failed ({relative}): {exc}")
+
     def release_page_url(self) -> str:
         return f"https://github.com/{APP_GITHUB_REPO}/releases/latest"
 
@@ -3855,7 +3919,7 @@ Start-Process -FilePath $exePath
     def subtitle_file_candidates(self, path: Path, suffix: str) -> list[Path]:
         path = Path(path)
         app_dir = self.app_base_dir()
-        conf_srt = app_dir / "_conf" / "srt"
+        conf_srt = self.conf_dir / "srt"
         candidates = [
             path.with_suffix(suffix),
             path.parent / "srt" / f"{path.stem}{suffix}",
@@ -5077,7 +5141,16 @@ Start-Process -FilePath $exePath
 
     def tray_menu_popup_pos(self) -> QPoint:
         cursor_pos = QCursor.pos()
-        return QPoint(cursor_pos.x(), cursor_pos.y() - 36)
+        popup = getattr(self, "playlist_popup_menu", None)
+        size_hint = popup.sizeHint() if popup is not None else QSize(0, 0)
+        x = cursor_pos.x() - size_hint.width()
+        y = cursor_pos.y() - size_hint.height() - 40
+        screen = QApplication.screenAt(cursor_pos) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left(), min(x, area.right() - size_hint.width()))
+            y = max(area.top(), min(y, area.bottom() - size_hint.height()))
+        return QPoint(x, y)
 
     def show_playlist_window(self):
         popup = getattr(self, "playlist_popup_menu", None)
@@ -5338,7 +5411,7 @@ Start-Process -FilePath $exePath
         self.current_playlist_name = self.sanitize_playlist_name(name)
 
     def default_playlist_path(self, suffix: str = ".m3u8") -> Path:
-        conf_dir = self.app_base_dir() / "_conf" / "lst"
+        conf_dir = self.conf_playlist_dir
         try:
             conf_dir.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
@@ -5347,8 +5420,9 @@ Start-Process -FilePath $exePath
 
     def saved_playlist_files(self) -> list[Path]:
         roots = [
+            self.conf_playlist_dir,
+            self.conf_dir,
             self.app_base_dir() / "_conf" / "lst",
-            self.app_base_dir() / "_conf",
         ]
         files: list[Path] = []
         for root in roots:
@@ -5847,7 +5921,7 @@ Start-Process -FilePath $exePath
         return mapping.get(str(lang).strip().lower(), str(lang))
 
     def subtitle_output_paths(self, path: Path) -> tuple[Path, Path]:
-        out_dir = self.app_base_dir() / "_conf" / "srt"
+        out_dir = self.conf_dir / "srt"
         return out_dir / f"{path.stem}.srt", out_dir / f"{path.stem}.srt2"
 
     def ollama_translate_text(self, text: str, target_lang: str, source_lang: str = "auto") -> str:
@@ -6070,7 +6144,7 @@ Start-Process -FilePath $exePath
             app_log("whisper not found")
             return
 
-        out_dir = self.app_base_dir() / "_conf" / "srt"
+        out_dir = self.conf_dir / "srt"
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except Exception as e:

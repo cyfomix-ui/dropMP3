@@ -97,6 +97,14 @@ PyInstaller による EXE 化用スクリプトを同梱しています。
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
+Inno Setup 6 を導入すると、Setup版とSHA-256も生成できます。
+
+```powershell
+.\build_installer.ps1
+```
+
+Setup版のユーザー設定、プレイリスト、生成字幕は `%LOCALAPPDATA%\DropMP3` に保存され、更新やアンインストール後も保持されます。Portable版はSetup版と並行して配布できます。
+
 別バージョンのビルドスクリプトとして `build_dropmp3.ps1` もあります。
 
 ### ディレクトリ構成
@@ -222,6 +230,14 @@ The repository includes a PyInstaller build script for creating a Windows execut
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
+
+With Inno Setup 6 installed, build the per-user Setup package and SHA-256 checksum with:
+
+```powershell
+.\build_installer.ps1
+```
+
+The installed build stores settings, playlists, and generated subtitles under `%LOCALAPPDATA%\DropMP3`, preserving them across upgrades and uninstall. The portable package remains available alongside Setup.
 
 An alternative build script is also available as `build_dropmp3.ps1`.
 

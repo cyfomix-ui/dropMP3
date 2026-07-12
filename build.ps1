@@ -103,7 +103,7 @@ python -m PyInstaller `
     --add-data "$IconPath;." `
     --add-data "$AboutImagePath;." `
     --add-data "$SplashPng;." `
-    --add-data "$((Resolve-Path -LiteralPath '.\_conf').Path);_conf" `
+    --add-data "$((Resolve-Path -LiteralPath '.\_conf\app_version.xml').Path);_conf" `
     $MainPath
 
 # ==============================
@@ -128,8 +128,13 @@ if (Test-Path -LiteralPath $ConfSrc) {
     if (Test-Path -LiteralPath $ConfOut) {
         Remove-Item -LiteralPath $ConfOut -Recurse -Force
     }
-    Copy-Item -LiteralPath $ConfSrc -Destination $ConfOut -Recurse -Force
-    Write-Host "設定/Helpをコピーしました:"
+    New-Item -ItemType Directory -Force -Path $ConfOut | Out-Null
+    Copy-Item -LiteralPath (Join-Path $ConfSrc "app_version.xml") -Destination $ConfOut -Force
+    $HtmlSrc = Join-Path $ConfSrc "html"
+    if (Test-Path -LiteralPath $HtmlSrc) {
+        Copy-Item -LiteralPath $HtmlSrc -Destination $ConfOut -Recurse -Force
+    }
+    Write-Host "配布用バージョン情報/Helpをコピーしました:"
     Write-Host $ConfOut
 }
 

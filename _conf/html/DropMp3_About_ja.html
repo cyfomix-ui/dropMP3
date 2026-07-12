@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DropMp3について</title>
+  <style>
+    body{font-family:"Yu Gothic UI",Meiryo,sans-serif;margin:28px;line-height:1.75;color:#e8ece8;background:#101214}
+    h1{color:#62e781;margin-bottom:4px}h2{color:#f0fff2;border-left:6px solid #20b15a;padding-left:10px;margin-top:28px}
+    .hero{display:flex;gap:18px;align-items:center}.icon{width:56px;height:56px;max-width:56px;max-height:56px;border-radius:12px;object-fit:contain}
+    table{border-collapse:collapse}td{padding:6px 12px;border-bottom:1px solid #303830}.key{font-weight:700;color:#9af0ad}
+    ul{padding-left:1.4em}.note{background:#17251c;border:1px solid #2e7d44;padding:10px 14px;border-radius:6px}
+    code{background:#0b0d0e;border:1px solid #303830;border-radius:4px;padding:1px 4px;color:#caffbf}
+  </style>
+</head>
+<body>
+  <div class="hero">
+    <img class="icon" src="../DropMp3.png" alt="DropMp3 icon">
+    <div>
+      <h1>DropMp3</h1>
+      <div>ドラッグ＆ドロップで音楽を再生するシンプルな音楽プレイヤーです。</div>
+    </div>
+  </div>
+  <h2>情報</h2>
+  <table>
+    <tr><td class="key">作成日</td><td>2026-06-14</td></tr>
+    <tr><td class="key">Build日付</td><td>2026-06-14</td></tr>
+    <tr><td class="key">作成者</td><td>MVCreator / Codex</td></tr>
+    <tr><td class="key">用途</td><td>ローカル音楽ファイルの再生、プレイリスト管理、字幕確認</td></tr>
+  </table>
+  <h2>できること</h2>
+  <ul>
+    <li>MP3、WAV、FLAC、OGG、M4A、AAC、WMAなどの音声ファイルを再生します。</li>
+    <li>音声ファイル、フォルダ、M3U8/WPLなどのリストをドロップして追加できます。</li>
+    <li>保存済みプレイリストを <code>_conf</code> から選択して読み込めます。</li>
+    <li>プレイリスト検索、シャッフル、ファイル名順ソート、リピート再生を扱えます。</li>
+    <li>アルバムアート表示、ランダムアート表示、ワンショット再生に対応します。</li>
+    <li>SRT字幕の表示、確認、Whisperによる字幕作成を扱えます。</li>
+  </ul>
+  <p class="note">設定は <code>_conf</code>、Helpは <code>_conf\html</code>、保存済みプレイリストは <code>_conf\lst</code> を使います。</p>
+</body>
+</html>

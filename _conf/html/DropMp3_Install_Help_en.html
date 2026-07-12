@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DropMp3 Install Guide</title>
+  <style>
+    body{font-family:"Segoe UI","Yu Gothic UI",sans-serif;margin:28px;line-height:1.7;color:#e8ece8;background:#101214}
+    h1{color:#62e781}h2{color:#f0fff2;border-left:6px solid #20b15a;padding-left:10px;margin-top:28px}
+    code,pre{background:#0b0d0e;border:1px solid #303830;border-radius:4px;color:#caffbf}code{padding:1px 4px}pre{padding:12px;overflow-x:auto}
+    .note{background:#17251c;border:1px solid #2e7d44;padding:10px 14px;border-radius:6px}
+  </style>
+</head>
+<body>
+  <h1>DropMp3 Install Guide</h1>
+  <p class="note">Basic music playback does not require extra command-line tools. Install the optional tools only when you need subtitle creation or detailed media information.</p>
+  <h2>Python / Required Libraries</h2>
+  <pre>python -m pip install --upgrade pip
+python -m pip install --upgrade PySide6 mutagen pyinstaller</pre>
+  <h2>Whisper</h2>
+  <pre>python -m pip install -U openai-whisper
+whisper --help</pre>
+  <h2>FFmpeg / ffprobe</h2>
+  <pre>winget install Gyan.FFmpeg
+ffmpeg -version
+ffprobe -version</pre>
+  <h2>Settings File</h2>
+  <p>Settings are stored in <code>_conf\DropMp3.ini</code> instead of the registry.</p>
+  <p>Help HTML files are placed in <code>_conf\html</code>, and playlists are placed in <code>_conf\lst</code>.</p>
+  <p>Subtitle files are saved under <code>_conf\srt</code>. When Both is selected, DropMp3 creates <code>.srt</code> and <code>.srt2</code>.</p>
+  <pre>[General]
+volume=0.8
+playlist_json=[]</pre>
+</body>
+</html>
