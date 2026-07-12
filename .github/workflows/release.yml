@@ -29,10 +29,16 @@ jobs:
       - name: Build Setup and checksum
         shell: pwsh
         run: .\build_installer.ps1 -SkipAppBuild
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $version = ([xml](Get-Content .\_conf\app_version.xml -Raw)).DropMp3Version.version
+          "value=$version" >> $env:GITHUB_OUTPUT
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          name: Ver ${{ github.ref_name }}
+          name: Ver ${{ steps.version.outputs.value }}
           generate_release_notes: true
           make_latest: true
           files: |
