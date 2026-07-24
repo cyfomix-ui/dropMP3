@@ -9,7 +9,7 @@ DropMP3 は、音楽ファイルをドラッグ＆ドロップしてすぐ再生
 
 ## 画面イメージ
 
-![DropMP3 screenshot](docs/images/dropmp3-overview.png)
+![DropMP3 screenshot](docs/images/dropmp3-overview-v108.png)
 
 ### 主な機能
 
