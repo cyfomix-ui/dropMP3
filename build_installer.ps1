@@ -36,12 +36,13 @@ New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 & $iscc "/DMyAppVersion=$version" "/DMySourceDir=$sourceDir" "/DMyOutputDir=$outputDir" ".\installer\DropMP3.iss"
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup Compiler が終了コード $LASTEXITCODE で失敗しました。" }
 
-$setupPath = Join-Path $outputDir "DropMP3-Setup-$version-x64.exe"
+$displayVersion = "Ver$version"
+$setupPath = Join-Path $outputDir "DropMP3-Setup-$displayVersion-x64.exe"
 if (-not (Test-Path -LiteralPath $setupPath)) { throw "Setupファイルが生成されませんでした: $setupPath" }
 $hashPath = "$setupPath.sha256"
 $hash = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath $hashPath -Encoding ascii -Value "$hash  $([IO.Path]::GetFileName($setupPath))"
-$portablePath = Join-Path $outputDir "DropMP3-v$version-Portable-x64.zip"
+$portablePath = Join-Path $outputDir "DropMP3-Portable-$displayVersion-x64.zip"
 Compress-Archive -Path (Join-Path $sourceDir "DropMP3.exe"), (Join-Path $sourceDir "_conf") -DestinationPath $portablePath -Force
 $portableHashPath = "$portablePath.sha256"
 $portableHash = (Get-FileHash -LiteralPath $portablePath -Algorithm SHA256).Hash.ToLowerInvariant()

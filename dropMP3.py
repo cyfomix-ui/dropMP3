@@ -160,15 +160,12 @@ def read_app_version(base_dir: Path | None = None) -> str:
 
 def format_version_label(version: str) -> str:
     value = normalize_version_text(version) or APP_VERSION_FALLBACK
-    return f"v{value}"
+    return f"Ver{value}"
 
 
 def normalize_version_text(text: str) -> str:
     value = str(text or "").strip()
-    if value.lower().startswith("ver "):
-        value = value[4:].strip()
-    if value.lower().startswith("v"):
-        value = value[1:].strip()
+    value = re.sub(r"^(?:ver\s*|v\s*)", "", value, count=1, flags=re.IGNORECASE)
     return value
 
 
@@ -626,6 +623,7 @@ class LogBus(QObject):
 
 LOG_BUS = LogBus()
 LOG_HISTORY: list[str] = []
+LOG_HISTORY_MAX_LINES = 3000
 
 
 def make_log_line(message: str) -> str:
@@ -645,6 +643,8 @@ def app_log(message: str):
     for line in text.splitlines():
         log_line = make_log_line(line)
         LOG_HISTORY.append(log_line)
+        if len(LOG_HISTORY) > LOG_HISTORY_MAX_LINES:
+            del LOG_HISTORY[:len(LOG_HISTORY) - LOG_HISTORY_MAX_LINES]
         LOG_BUS.message.emit(log_line)
 
 
@@ -1592,6 +1592,7 @@ class LogWindow(QWidget):
         self.resize(860, 420)
         self.text = QTextEdit()
         self.text.setReadOnly(True)
+        self.text.document().setMaximumBlockCount(LOG_HISTORY_MAX_LINES)
         self.text.setStyleSheet("""
             QTextEdit {
                 background-color: #101010;
@@ -1616,7 +1617,7 @@ class LogWindow(QWidget):
         self.scroll_to_bottom()
 
     def append(self, line: str):
-        if not self.loaded_history:
+        if not self.loaded_history or not self.isVisible():
             return
         self.text.append(line)
         self.scroll_to_bottom()
@@ -1625,6 +1626,10 @@ class LogWindow(QWidget):
         self.load_history_once()
         self.scroll_to_bottom()
         super().showEvent(event)
+
+    def hideEvent(self, event):
+        self.loaded_history = False
+        super().hideEvent(event)
 
     def scroll_to_bottom(self):
         bar = self.text.verticalScrollBar()
@@ -2045,6 +2050,20 @@ class MiniDropPlayer(QWidget):
         self.property_dialogs = []
         self.whisper_dialogs = []
         self.help_dialogs = []
+        self.display_title_cache: dict[str, tuple[int | None, str]] = {}
+        self.subtitle_status_cache: dict[str, tuple[bool, bool]] = {}
+        self.playlist_view_rows: dict[int, int] = {}
+        self.settings_dirty = False
+        self._saving_settings = False
+        self._last_subtitle_control_state = None
+        self._last_art_render_key = None
+
+        self.settings_save_timer = QTimer(self)
+        self.settings_save_timer.setSingleShot(True)
+        self.settings_save_timer.timeout.connect(self.save_settings)
+        self.art_resize_timer = QTimer(self)
+        self.art_resize_timer.setSingleShot(True)
+        self.art_resize_timer.timeout.connect(self.set_art_pixmap)
 
         # Header title style: strong Latin font + Japanese-capable fallbacks.
         # Impact is used for English glyphs; Japanese falls back to Yu Gothic UI / Meiryo.
@@ -2097,8 +2116,8 @@ class MiniDropPlayer(QWidget):
         QTimer.singleShot(1800, self.schedule_startup_update_check)
 
         self.autosave_timer = QTimer(self)
-        self.autosave_timer.timeout.connect(self.save_settings)
-        self.autosave_timer.start(5000)
+        self.autosave_timer.timeout.connect(self.autosave_if_dirty)
+        self.autosave_timer.start(30000)
         self.update_startup_splash("起動完了", 96)
         app_log("MiniDropPlayer init complete")
 
@@ -2301,6 +2320,7 @@ class MiniDropPlayer(QWidget):
         return list(range(start, end))
 
     def populate_tray_playlist_preview(self, menu: QMenu):
+        self.tray_play_pause_button = None
         indices = self.tray_playlist_preview_indices()
         if not indices:
             empty_action = QAction(T("曲がありません"), self)
@@ -2317,11 +2337,16 @@ class MiniDropPlayer(QWidget):
             title = self.get_display_title(path)
             text = f"{prefix}{idx + 1:02d}. {title}"
             if is_current:
-                button = QPushButton(text)
-                button.setFlat(True)
-                button.setCursor(Qt.CursorShape.PointingHandCursor)
-                button.setToolTip(str(path))
-                button.setStyleSheet("""
+                row_widget = QWidget(menu)
+                row_layout = QHBoxLayout(row_widget)
+                row_layout.setContentsMargins(0, 0, 6, 0)
+                row_layout.setSpacing(4)
+
+                title_button = QPushButton(text)
+                title_button.setFlat(True)
+                title_button.setCursor(Qt.CursorShape.PointingHandCursor)
+                title_button.setToolTip(str(path))
+                title_button.setStyleSheet("""
                     QPushButton {
                         background: transparent;
                         border: none;
@@ -2335,9 +2360,35 @@ class MiniDropPlayer(QWidget):
                         color: #ffb36a;
                     }
                 """)
-                button.clicked.connect(lambda checked=False, i=idx, m=menu: (m.close(), self.play_index(i, autoplay=True)))
+                title_button.clicked.connect(lambda checked=False, i=idx, m=menu: (m.close(), self.play_index(i, autoplay=True)))
+
+                play_pause_button = QPushButton()
+                play_pause_button.setFixedSize(32, 32)
+                play_pause_button.setCursor(Qt.CursorShape.PointingHandCursor)
+                play_pause_button.setToolTip(T("再生 / 一時停止を切り替えます"))
+                play_pause_button.setStyleSheet("""
+                    QPushButton {
+                        background: #2b2b2b;
+                        border: 1px solid #666;
+                        border-radius: 16px;
+                        color: white;
+                        font-size: 16px;
+                        padding: 0;
+                    }
+                    QPushButton:hover {
+                        background: #3a3028;
+                        border-color: #ff9b45;
+                        color: #ffb36a;
+                    }
+                """)
+                play_pause_button.clicked.connect(lambda checked=False: self.toggle_play())
+                self.tray_play_pause_button = play_pause_button
+                self.update_tray_play_pause_button()
+
+                row_layout.addWidget(title_button, stretch=1)
+                row_layout.addWidget(play_pause_button, alignment=Qt.AlignRight | Qt.AlignVCenter)
                 button_action = QWidgetAction(menu)
-                button_action.setDefaultWidget(button)
+                button_action.setDefaultWidget(row_widget)
                 menu.addAction(button_action)
             else:
                 action = QAction(text, self)
@@ -2362,15 +2413,6 @@ class MiniDropPlayer(QWidget):
         self.tray_icon.show()
         self.hide()
         app_log("Minimized to system tray")
-        try:
-            self.tray_icon.showMessage(
-                "DropMp3",
-                T("タスクトレイに格納しました。アイコンをダブルクリックすると通常Playerに戻ります。"),
-                QSystemTrayIcon.MessageIcon.Information,
-                2500,
-            )
-        except Exception:
-            pass
 
     def on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -2730,7 +2772,8 @@ class MiniDropPlayer(QWidget):
         self.volume_label = VolumeLabel()
         self.update_volume_label()
 
-        control_layout = QHBoxLayout()
+        self.control_panel = QWidget()
+        control_layout = QHBoxLayout(self.control_panel)
         control_layout.setContentsMargins(0, 0, 0, 0)
         control_layout.addWidget(self.volume_label, alignment=Qt.AlignLeft | Qt.AlignVCenter)
         control_layout.addStretch(1)
@@ -2744,6 +2787,22 @@ class MiniDropPlayer(QWidget):
         control_layout.addWidget(self.one_shot_button)
         control_layout.addWidget(self.gear_button)
         control_layout.addWidget(self.help_button)
+        self.control_panel.setToolTip(T("マウスホイールで音量調節"))
+
+        self.volume_control_panel_widgets = [
+            self.control_panel,
+            self.prev_button,
+            self.seek_back_button,
+            self.play_button,
+            self.seek_forward_button,
+            self.next_button,
+            self.subtitle_font_button,
+            self.one_shot_button,
+            self.gear_button,
+            self.help_button,
+        ]
+        for widget in self.volume_control_panel_widgets:
+            widget.installEventFilter(self)
 
         self.small_time_label = QLabel("0:00 / 0:00")
         self.small_time_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -2845,7 +2904,7 @@ class MiniDropPlayer(QWidget):
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([320, 720])
-        self.main_splitter.splitterMoved.connect(lambda *_: self.save_settings())
+        self.main_splitter.splitterMoved.connect(lambda *_: self.request_save_settings())
 
         self.main_area_layout = QHBoxLayout()
         self.main_area_layout.setContentsMargins(0, 0, 0, 0)
@@ -2861,7 +2920,7 @@ class MiniDropPlayer(QWidget):
         self.root_layout.addWidget(self.art_title_label)
         self.root_layout.addWidget(self.header_widget)
         self.root_layout.addLayout(self.main_area_layout, stretch=1)
-        self.root_layout.addLayout(control_layout)
+        self.root_layout.addWidget(self.control_panel)
         self.root_layout.addLayout(self.small_control_layout)
         self.root_layout.addLayout(seek_layout)
         self.setLayout(self.root_layout)
@@ -3135,6 +3194,7 @@ class MiniDropPlayer(QWidget):
         self.add_files_to_playlist(files, row, autoplay=True)
 
     def collect_audio_files(self, folder: Path):
+        perf_start = time.perf_counter()
         app_log(f"Collect audio files from folder: {folder}")
         result = []
         for root, _dirs, names in os.walk(folder):
@@ -3143,7 +3203,11 @@ class MiniDropPlayer(QWidget):
                 if path.suffix.lower() in AUDIO_EXTS:
                     result.append(path)
         app_log(f"Collected {len(result)} audio file(s)")
-        return sorted(result)
+        result = sorted(result)
+        elapsed_ms = (time.perf_counter() - perf_start) * 1000
+        if elapsed_ms >= 50:
+            app_log(f"[PERF] collect_audio_files: {elapsed_ms:.1f} ms, items={len(result)}")
+        return result
 
     def current_media_path(self) -> Path | None:
         if self.one_shot_path is not None:
@@ -3152,10 +3216,11 @@ class MiniDropPlayer(QWidget):
             return self.playlist[self.current_index]
         return None
 
-    def play_index(self, index: int, autoplay=True, restore_position=0):
+    def play_index(self, index: int, autoplay=True, restore_position=0, refresh_playlist=False):
         if not self.playlist or not (0 <= index < len(self.playlist)):
             app_log(f"play_index ignored: index={index}")
             return
+        previous_index = self.current_index
         self.current_index = index
         self.one_shot_path = None
         path = self.playlist[index]
@@ -3168,7 +3233,10 @@ class MiniDropPlayer(QWidget):
         has_original_art = self.load_album_art(path)
         self.prepare_random_art_for_current_track(has_original_art)
         self.load_subtitles_for(path)
-        self.update_playlist_panel()
+        if refresh_playlist:
+            self.update_playlist_panel()
+        else:
+            self.update_playlist_playing_items(previous_index, index)
         self.update_left_panel_visibility()
         if autoplay:
             self.player.play()
@@ -3322,6 +3390,14 @@ class MiniDropPlayer(QWidget):
             self.small_play_button.setText("▶")
             # 一時停止・停止中はランダム画像の自動切替も止める。
             self.pause_random_art_timers_for_playback_pause()
+        self.update_tray_play_pause_button()
+
+    def update_tray_play_pause_button(self):
+        button = getattr(self, "tray_play_pause_button", None)
+        if button is None:
+            return
+        is_playing = self.player.playbackState() == QMediaPlayer.PlayingState
+        button.setText("⏸" if is_playing else "▶")
 
     def on_player_error(self, error, error_string):
         app_log(f"[PLAYER ERROR] error={error}, message={error_string}")
@@ -3341,7 +3417,11 @@ class MiniDropPlayer(QWidget):
         self.current_time_label.setText(format_ms(position))
         self.update_small_time_label(position, self.player.duration())
         self.subtitle_overlay.update_position(position)
-        self.update_subtitle_controls()
+        self.subtitle_overlay.setVisible(
+            self.subtitle_overlay.current_index >= 0
+            and self.subtitle_display_mode != 0
+            and not self.subtitles_manually_hidden
+        )
         if not self.user_is_seeking:
             self.position_slider.setValue(position)
 
@@ -3359,7 +3439,11 @@ class MiniDropPlayer(QWidget):
         self.current_time_label.setText(format_ms(position))
         self.update_small_time_label(position, self.player.duration())
         self.subtitle_overlay.update_position(position)
-        self.update_subtitle_controls()
+        self.subtitle_overlay.setVisible(
+            self.subtitle_overlay.current_index >= 0
+            and self.subtitle_display_mode != 0
+            and not self.subtitles_manually_hidden
+        )
 
     def on_seek_end(self):
         self.user_is_seeking = False
@@ -3368,18 +3452,32 @@ class MiniDropPlayer(QWidget):
         self.save_settings()
 
     def get_display_title(self, path: Path):
+        key = str(Path(path).resolve()).casefold()
+        try:
+            mtime = path.stat().st_mtime_ns
+        except OSError:
+            mtime = None
+        cached = self.display_title_cache.get(key)
+        if cached and cached[0] == mtime:
+            return cached[1]
         try:
             audio = MutagenFile(str(path), easy=True)
             if audio:
                 title = audio.get("title", [None])[0]
                 artist = audio.get("artist", [None])[0]
                 if title and artist:
-                    return f"{artist} - {title}"
+                    result = f"{artist} - {title}"
+                    self.display_title_cache[key] = (mtime, result)
+                    return result
                 if title:
-                    return title
+                    result = str(title)
+                    self.display_title_cache[key] = (mtime, result)
+                    return result
         except Exception as e:
             app_log(f"[TAG] title read failed: {e}")
-        return path.stem
+        result = path.stem
+        self.display_title_cache[key] = (mtime, result)
+        return result
 
     def apply_random_title_style(self, title: str):
         if title == self.current_title_style_key:
@@ -3555,12 +3653,16 @@ class MiniDropPlayer(QWidget):
         self.save_settings()
 
     def load_album_art(self, path: Path):
+        perf_start = time.perf_counter()
         image_data = self.extract_album_art(path)
         if not image_data:
             self.original_art_pixmap = QPixmap()
             self.art_source_pixmap = QPixmap()
             self.art_label.setPixmap(QPixmap())
             self.art_label.setText("Album Art")
+            elapsed_ms = (time.perf_counter() - perf_start) * 1000
+            if elapsed_ms >= 50:
+                app_log(f"[PERF] load_album_art: {elapsed_ms:.1f} ms, found=False")
             return False
         pixmap = QPixmap()
         ok = pixmap.loadFromData(image_data)
@@ -3574,6 +3676,9 @@ class MiniDropPlayer(QWidget):
         self.art_source_pixmap = pixmap
         self.art_label.setText("")
         self.set_art_pixmap()
+        elapsed_ms = (time.perf_counter() - perf_start) * 1000
+        if elapsed_ms >= 50:
+            app_log(f"[PERF] load_album_art: {elapsed_ms:.1f} ms, found=True")
         return True
 
     def extract_album_art(self, path: Path):
@@ -3601,9 +3706,13 @@ class MiniDropPlayer(QWidget):
         target = self.art_label.size()
         if target.width() <= 0 or target.height() <= 0:
             return
+        render_key = (self.art_source_pixmap.cacheKey(), target.width(), target.height())
+        if render_key == self._last_art_render_key:
+            return
         scaled = self.art_source_pixmap.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self.art_label.setText("")
         self.art_label.setPixmap(scaled)
+        self._last_art_render_key = render_key
 
     def app_base_dir(self) -> Path:
         T("""EXE配布時はEXEのある場所、Python実行時はスクリプトのある場所を返す。""")
@@ -4029,6 +4138,7 @@ Start-Process -FilePath $exePath
                 deleted.append(str(srt_path))
             except Exception as exc:
                 failed.append(f"{srt_path}\n  {exc}")
+        self.invalidate_subtitle_status(path)
 
         try:
             current = self.current_media_path()
@@ -4057,6 +4167,7 @@ Start-Process -FilePath $exePath
         app_log(f"Subtitle deleted for {path.name}: {len(deleted)} file(s)")
 
     def load_subtitles_for(self, path: Path):
+        perf_start = time.perf_counter()
         srt_path = self.find_srt_for(path)
         srt2_path = self.find_srt2_for(path)
         if not srt_path and not srt2_path:
@@ -4068,6 +4179,9 @@ Start-Process -FilePath $exePath
             self.subtitles_manually_hidden = False
             self.subtitle_overlay.set_cues([])
             self.update_subtitle_controls()
+            elapsed_ms = (time.perf_counter() - perf_start) * 1000
+            if elapsed_ms >= 50:
+                app_log(f"[PERF] load_subtitles_for: {elapsed_ms:.1f} ms, cues=0")
             return
         try:
             self.subtitle_primary_cues = parse_srt(srt_path) if srt_path else []
@@ -4086,6 +4200,9 @@ Start-Process -FilePath $exePath
                 f"SRT loaded: primary={srt_path if srt_path else 'none'} ({len(self.subtitle_primary_cues)} cues), "
                 f"secondary={srt2_path if srt2_path else 'none'} ({len(self.subtitle_secondary_cues)} cues)"
             )
+            elapsed_ms = (time.perf_counter() - perf_start) * 1000
+            if elapsed_ms >= 50:
+                app_log(f"[PERF] load_subtitles_for: {elapsed_ms:.1f} ms, cues={len(self.subtitle_primary_cues) + len(self.subtitle_secondary_cues)}")
         except Exception as e:
             app_log(f"[SRT ERROR] {srt_path or srt2_path}: {e}")
             self.subtitle_primary_cues = []
@@ -4188,14 +4305,16 @@ Start-Process -FilePath $exePath
         has_srt = bool(self.subtitle_cues)
         has_current = has_srt and self.subtitle_overlay.current_index >= 0
         should_show_panel = has_srt and not self.subtitles_manually_hidden and self.subtitle_display_mode != 0
+        control_state = (has_any, has_srt, has_current, should_show_panel, self.subtitle_display_mode, self.subtitles_manually_hidden)
 
         if hasattr(self, "subtitle_toggle_button"):
             self.subtitle_toggle_button.blockSignals(True)
             self.subtitle_toggle_button.setEnabled(has_any)
             self.subtitle_toggle_button.setChecked(bool(self.subtitle_display_mode and not self.subtitles_manually_hidden and has_srt))
             self.subtitle_toggle_button.blockSignals(False)
-            self.set_subtitle_toggle_button_style(self.subtitle_display_mode if not self.subtitles_manually_hidden else 0, has_any)
-            self.subtitle_toggle_button.setToolTip(self.subtitle_mode_tooltip())
+            if control_state != self._last_subtitle_control_state:
+                self.set_subtitle_toggle_button_style(self.subtitle_display_mode if not self.subtitles_manually_hidden else 0, has_any)
+                self.subtitle_toggle_button.setToolTip(self.subtitle_mode_tooltip())
 
         if not hasattr(self, "subtitle_close_button"):
             return
@@ -4210,6 +4329,7 @@ Start-Process -FilePath $exePath
             self.subtitle_overlay.hide()
         else:
             self.subtitle_overlay.setVisible(should_show_panel and has_current)
+        self._last_subtitle_control_state = control_state
 
     def hide_subtitle_panel(self):
         if not self.subtitle_primary_cues and not self.subtitle_secondary_cues:
@@ -4254,9 +4374,9 @@ Start-Process -FilePath $exePath
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.set_art_pixmap()
+        if hasattr(self, "art_resize_timer"):
+            self.art_resize_timer.start(120)
         self.update_left_panel_visibility()
-        self.update_subtitle_controls()
         self.position_random_art_notice()
 
     def update_left_panel_visibility(self):
@@ -4274,7 +4394,6 @@ Start-Process -FilePath $exePath
         # ドロワーは明示的に開いた時だけ左リストを表示する。
         # これにより、横幅が広い時でも「左に開ける場所」が常に分かる。
         should_show = bool(self.drawer_open and has_playlist)
-        was_visible = self.left_playlist_visible
         self.left_panel.setVisible(should_show)
         self.left_playlist_visible = should_show
         self.header_widget.setVisible(not self.is_art_only_mode and not self.is_one_shot_panel_mode)
@@ -4283,7 +4402,6 @@ Start-Process -FilePath $exePath
             self.drawer_button.setToolTip(T("再生リストを閉じる") if should_show else T("再生リストを開く"))
         if should_show:
             self.restore_main_splitter_sizes_later()
-        self.update_playlist_panel()
 
     def toggle_playlist_drawer(self):
         self.drawer_open = not bool(self.drawer_open)
@@ -4462,7 +4580,7 @@ Start-Process -FilePath $exePath
 
     def change_volume_by_wheel(self, delta: int, event=None, owner=None):
         step_count = int(delta / 120) if abs(delta) >= 120 else (1 if delta > 0 else -1)
-        new_volume = max(0.0, min(1.0, self.audio.volume() + step_count * 0.05))
+        new_volume = max(0.0, min(1.0, self.audio.volume() + step_count * 0.03))
         self.audio.setVolume(new_volume)
         self.update_volume_label()
         percent = int(round(new_volume * 100))
@@ -4502,6 +4620,15 @@ Start-Process -FilePath $exePath
             delta = event.angleDelta().y()
             if delta:
                 self.change_control_icon_scale_by_wheel(delta, event, obj)
+                event.accept()
+                return True
+        if (
+            obj in getattr(self, "volume_control_panel_widgets", [])
+            and event.type() == QEvent.Type.Wheel
+        ):
+            delta = event.angleDelta().y()
+            if delta:
+                self.change_volume_by_wheel(delta, event, obj)
                 event.accept()
                 return True
         return super().eventFilter(obj, event)
@@ -4889,23 +5016,76 @@ Start-Process -FilePath $exePath
                 indices.append(i)
         return indices
 
+    def cached_subtitle_status(self, path: Path) -> tuple[bool, bool]:
+        key = str(Path(path).resolve()).casefold()
+        cached = self.subtitle_status_cache.get(key)
+        if cached is None:
+            cached = (bool(self.find_srt_for(path)), bool(self.find_srt2_for(path)))
+            self.subtitle_status_cache[key] = cached
+        return cached
+
+    def invalidate_subtitle_status(self, path: Path):
+        self.subtitle_status_cache.pop(str(Path(path).resolve()).casefold(), None)
+
+    def style_playlist_item(self, item: QListWidgetItem, playlist_index: int, playing: bool):
+        path = self.playlist[playlist_index]
+        title = self.get_display_title(path)
+        text = f"{playlist_index + 1:02d}. {title}"
+        has_srt, has_srt2 = self.cached_subtitle_status(path)
+        color = QColor("#36c96b") if has_srt2 else QColor("#58a6ff") if has_srt else QColor("#ffffff")
+        tooltip = str(path)
+        if has_srt2:
+            tooltip += T("\n字幕: 第2字幕あり")
+        elif has_srt:
+            tooltip += T("\n字幕: あり")
+        font = item.font()
+        font.setBold(playing)
+        item.setFont(font)
+        item.setText(("▶ " if playing else "") + text)
+        item.setForeground(QColor("#ff9b45") if playing else color)
+        item.setToolTip(tooltip)
+
+    def update_playlist_playing_items(self, previous_index: int, current_index: int):
+        if not hasattr(self, "left_list"):
+            return
+        old_block = self.left_list.blockSignals(True)
+        for index, playing in ((previous_index, False), (current_index, True)):
+            row = self.playlist_view_rows.get(index)
+            if row is None:
+                continue
+            item = self.left_list.item(row)
+            if item is not None:
+                self.style_playlist_item(item, index, playing and self.one_shot_path is None)
+        row = self.playlist_view_rows.get(current_index)
+        if row is not None and self.one_shot_path is None:
+            self.left_list.setCurrentRow(row)
+            self.left_list.scrollToItem(self.left_list.item(row), QAbstractItemView.PositionAtCenter)
+        self.left_list.blockSignals(old_block)
+        self.update_playlist_footer()
+        self.refresh_playlist_window()
+
     def update_playlist_panel(self):
+        perf_start = time.perf_counter()
         if not hasattr(self, "left_list"):
             return
         old_block = self.left_list.blockSignals(True)
         self.left_list.clear()
-        view_indices = self.playlist_view_indices()
-        for i in view_indices:
-            path = self.playlist[i]
+        query = self.playlist_search_text.strip().lower()
+        all_rows = [(i, path, self.get_display_title(path)) for i, path in enumerate(self.playlist)]
+        display_rows = [
+            row for row in all_rows
+            if not query or any(query in str(value).lower() for value in (row[2], row[1].name, str(row[1])))
+        ]
+        view_indices = [row[0] for row in display_rows]
+        self.playlist_view_rows = {index: row for row, index in enumerate(view_indices)}
+        for i, path, title in display_rows:
             number = f"{i + 1:02d}. "
-            title = self.get_display_title(path)
             text = number + title
             item = QListWidgetItem(text)
             item.setData(Qt.UserRole, i)
             item.setData(Qt.UserRole + 1, str(path))
             item.setToolTip(str(path))
-            has_srt = bool(self.find_srt_for(path))
-            has_srt2 = bool(self.find_srt2_for(path))
+            has_srt, has_srt2 = self.cached_subtitle_status(path)
             if has_srt2:
                 item.setForeground(QColor("#36c96b"))
                 item.setToolTip(str(path) + T("\n字幕: 第2字幕あり"))
@@ -4926,6 +5106,9 @@ Start-Process -FilePath $exePath
         self.left_list.blockSignals(old_block)
         self.update_playlist_footer()
         self.refresh_playlist_window()
+        elapsed_ms = (time.perf_counter() - perf_start) * 1000
+        if elapsed_ms >= 50:
+            app_log(f"[PERF] update_playlist_panel: {elapsed_ms:.1f} ms, items={len(self.playlist)}, visible={len(view_indices)}")
 
     def update_playlist_footer(self):
         if hasattr(self, "playlist_footer_label"):
@@ -6338,6 +6521,7 @@ Start-Process -FilePath $exePath
                     warn_label.show()
                     clean_srt_button.setEnabled(False)
                 app_log(f"Whisper completed: {expected_srt}" + (f", {expected_srt2}" if expected_srt2.exists() else ""))
+                self.invalidate_subtitle_status(path)
                 self.update_playlist_panel()
                 if self.current_media_path() == path:
                     self.subtitle_display_mode = 1 if expected_srt.exists() else (2 if expected_srt2.exists() else 0)
@@ -6549,7 +6733,32 @@ Start-Process -FilePath $exePath
             self.log_window.raise_()
             self.log_window.activateWindow()
 
+    def request_save_settings(self, delay_ms=500):
+        self.settings_dirty = True
+        self.settings_save_timer.start(max(0, int(delay_ms)))
+
+    def autosave_if_dirty(self):
+        if self.settings_dirty:
+            self.save_settings()
+
     def save_settings(self):
+        if self._saving_settings:
+            return
+        perf_start = time.perf_counter()
+        self._saving_settings = True
+        if hasattr(self, "settings_save_timer"):
+            self.settings_save_timer.stop()
+        try:
+            self._save_settings_values()
+            self.settings.sync()
+            self.settings_dirty = False
+        finally:
+            self._saving_settings = False
+            elapsed_ms = (time.perf_counter() - perf_start) * 1000
+            if elapsed_ms >= 50:
+                app_log(f"[PERF] save_settings: {elapsed_ms:.1f} ms, items={len(self.playlist)}")
+
+    def _save_settings_values(self):
         if self.is_art_only_mode:
             if self.normal_geometry_before_small_mode:
                 self.settings.setValue("geometry", self.normal_geometry_before_small_mode)
@@ -6562,7 +6771,7 @@ Start-Process -FilePath $exePath
             self.settings.setValue("geometry", self.geometry())
         self.settings.setValue("log_geometry", self.log_window.geometry())
         self.settings.setValue("log_visible", self.log_window.isVisible())
-        paths = [str(p) for p in self.playlist if p.exists()]
+        paths = [str(p) for p in self.playlist]
         self.settings.setValue("playlist_json", json.dumps(paths, ensure_ascii=False))
         self.settings.setValue("current_index", self.current_index)
         if self.one_shot_path is None:
@@ -6600,7 +6809,6 @@ Start-Process -FilePath $exePath
                     and int(sizes[1]) >= 128
                 ):
                     self.settings.setValue("main_splitter_sizes_json", json.dumps([int(sizes[0]), int(sizes[1])]))
-                    self.settings.sync()
                     app_log(f"Saved splitter sizes: left={int(sizes[0])}, art={int(sizes[1])}")
             except Exception as e:
                 app_log(f"[SETTINGS] splitter save failed: {e}")
@@ -6629,6 +6837,7 @@ Start-Process -FilePath $exePath
         QTimer.singleShot(500, restore)
 
     def load_settings(self):
+        perf_start = time.perf_counter()
         app_log("Load settings")
         self.update_startup_splash("設定とプレイリストを復元中...", 74)
         geo = self.settings.value("geometry")
@@ -6735,6 +6944,10 @@ Start-Process -FilePath $exePath
             QTimer.singleShot(100, self.enter_one_shot_panel_mode)
         if bool_from_settings(self.settings.value("log_visible", False), False):
             self.log_window.show()
+        self.settings_dirty = False
+        elapsed_ms = (time.perf_counter() - perf_start) * 1000
+        if elapsed_ms >= 50:
+            app_log(f"[PERF] load_settings: {elapsed_ms:.1f} ms, items={len(self.playlist)}")
 
 
     def setup_remote_control(self):

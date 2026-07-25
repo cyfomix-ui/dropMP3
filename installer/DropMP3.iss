@@ -13,7 +13,7 @@
 AppId={#MyAppId}
 AppName=DropMP3
 AppVersion={#MyAppVersion}
-AppVerName=DropMP3 {#MyAppVersion}
+AppVerName=DropMP3 Ver{#MyAppVersion}
 AppPublisher=cyfomix-ui
 AppPublisherURL=https://github.com/cyfomix-ui/dropMP3
 AppSupportURL=https://github.com/cyfomix-ui/dropMP3/issues
@@ -29,7 +29,7 @@ SolidCompression=yes
 WizardStyle=modern
 SetupIconFile=..\DropMP3.ico
 OutputDir={#MyOutputDir}
-OutputBaseFilename=DropMP3-Setup-{#MyAppVersion}-x64
+OutputBaseFilename=DropMP3-Setup-Ver{#MyAppVersion}-x64
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes

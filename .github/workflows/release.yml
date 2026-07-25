@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v[0-9]+.[0-9][0-9]'
+      - 'Ver[0-9]+.[0-9][0-9]'
 
 permissions:
   contents: write
@@ -12,33 +12,61 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
           cache: pip
+          cache-dependency-path: requirements-build.txt
+
+      - name: Verify tag and application version
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if ($tag -notmatch '^Ver(?<major>[0-9]+)\.(?<minor>[0-9]{2})$') {
+            throw "Release tag must use Ver1.02 format. Actual tag: $tag"
+          }
+
+          [xml]$versionXml = Get-Content -LiteralPath '.\_conf\app_version.xml' -Raw
+          $xmlVersion = [string]$versionXml.DropMp3Version.version
+          if ($xmlVersion -notmatch '^(?<major>[0-9]+)\.(?<minor>[0-9]{2})$') {
+            throw "_conf/app_version.xml must use 1.02 format. Actual version: $xmlVersion"
+          }
+
+          $tagMajor = [int]([regex]::Match($tag, '^Ver([0-9]+)\.([0-9]{2})$').Groups[1].Value)
+          $tagMinor = [int]([regex]::Match($tag, '^Ver([0-9]+)\.([0-9]{2})$').Groups[2].Value)
+          $xmlMajor = [int]([regex]::Match($xmlVersion, '^([0-9]+)\.([0-9]{2})$').Groups[1].Value)
+          $xmlMinor = [int]([regex]::Match($xmlVersion, '^([0-9]+)\.([0-9]{2})$').Groups[2].Value)
+          if ($tagMajor -ne $xmlMajor -or $tagMinor -ne $xmlMinor) {
+            throw "Version mismatch: tag=$tag, _conf/app_version.xml=$xmlVersion"
+          }
+          Write-Host "Version check passed: tag=$tag, internal=$xmlVersion"
+
       - name: Install Python build dependencies
         shell: pwsh
-        run: python -m pip install pyinstaller PySide6 mutagen
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
       - name: Build portable executable
         shell: pwsh
         run: .\build.ps1
+
       - name: Install Inno Setup
         shell: pwsh
         run: choco install innosetup --no-progress -y
-      - name: Build Setup and checksum
+
+      - name: Build Setup, Portable package, and SHA-256 files
         shell: pwsh
         run: .\build_installer.ps1 -SkipAppBuild
-      - name: Read application version
-        id: version
-        shell: pwsh
-        run: |
-          $version = ([xml](Get-Content .\_conf\app_version.xml -Raw)).DropMp3Version.version
-          "value=$version" >> $env:GITHUB_OUTPUT
+
       - name: Publish release assets
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          name: Ver ${{ steps.version.outputs.value }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           make_latest: true
           files: |

@@ -54,8 +54,7 @@ Write-Host ""
 Write-Host "[2/6] 必要パッケージを確認/インストール..."
 
 python -m pip install --upgrade pip
-python -m pip install --upgrade pyinstaller
-python -m pip install --upgrade PySide6 mutagen
+python -m pip install -r (Join-Path $RootDir "requirements-build.txt")
 
 # ==============================
 # 古いビルド削除
@@ -143,7 +142,9 @@ if (Test-Path -LiteralPath $ConfSrc) {
 # ==============================
 Write-Host ""
 Write-Host "[6/6] distフォルダを開きます..."
-Start-Process explorer.exe $DistDir
+if (-not $env:CI) {
+    Start-Process explorer.exe $DistDir
+}
 
 Write-Host ""
 Write-Host "========================================"

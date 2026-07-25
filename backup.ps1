@@ -1,6 +1,6 @@
 ﻿param(
     [string]$TargetDir = ".",
-    [string]$BackupDirName = "oldsource"
+    [string]$BackupDirName = "_OldSource"
 )
 
 $ErrorActionPreference = "Stop"
