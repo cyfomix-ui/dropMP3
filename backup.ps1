@@ -1,96 +1,37 @@
-﻿param(
-    [string]$TargetDir = ".",
-    [string]$BackupDirName = "_OldSource"
+<#
+.SYNOPSIS
+  Source/resource backup for AI handoff.
+.DESCRIPTION
+  Creates one versioned ZIP under .\_Oldsource. Build outputs, caches, old backups,
+  archives, and likely secret files are excluded. The ZIP includes a manifest and AI guide.
+.PARAMETER Bump
+  Increment the final numeric component before backup (0.7.10 -> 0.7.11, 1.09 -> 1.10).
+.PARAMETER SetVersion
+  Set an exact version before backup. Cannot be combined with -Bump.
+.PARAMETER Target
+  MvSticky only: All, PC, or PWA. Other projects use All.
+.PARAMETER Preview
+  Show version, file count, and output path without changing files or creating a ZIP.
+.EXAMPLE
+  .\Backup.ps1
+.EXAMPLE
+  .\Backup.ps1 -Bump
+.EXAMPLE
+  .\Backup.ps1 -SetVersion 0.8.00
+.EXAMPLE
+  .\Backup.ps1 -Target PWA -Preview
+#>
+[CmdletBinding()]
+param(
+    [ValidateSet('All','PC','PWA')][string]$Target = 'All',
+    [switch]$Bump,
+    [string]$SetVersion,
+    [switch]$Preview
 )
 
-$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'Backup.Common.ps1')
 
-# 対象フォルダを解決
-$target = Resolve-Path -LiteralPath $TargetDir
-$targetPath = $target.Path
-
-# バックアップ先 oldsource
-$backupDir = Join-Path $targetPath $BackupDirName
-if (-not (Test-Path -LiteralPath $backupDir)) {
-    New-Item -ItemType Directory -Path $backupDir | Out-Null
-}
-
-# 日付時間付きZIP名
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$zipName = "DropMp3_$stamp.zip"
-$zipPath = Join-Path $backupDir $zipName
-
-# 一時作業フォルダ
-$tempRoot = Join-Path $env:TEMP "DropMp3_backup_$stamp"
-if (Test-Path -LiteralPath $tempRoot) {
-    Remove-Item -LiteralPath $tempRoot -Recurse -Force
-}
-New-Item -ItemType Directory -Path $tempRoot | Out-Null
-
-try {
-    Write-Host "==== DropMp3 source backup ===="
-    Write-Host "Target : $targetPath"
-    Write-Host "Output : $zipPath"
-    Write-Host ""
-
-    # バックアップ対象
-    # pyソース、ps1、アイコン、画像ファイル
-    $patterns = @(
-        "*.py",
-        "*.ps1",
-        "*.ico",
-        "*.png",
-        "*.jpg",
-        "*.jpeg",
-        "*.webp",
-        "*.bmp",
-        "*.gif"
-    )
-
-    $files = @()
-
-    foreach ($pattern in $patterns) {
-        $files += Get-ChildItem -LiteralPath $targetPath -File -Filter $pattern -ErrorAction SilentlyContinue
-    }
-
-    # 重複除去
-    $files = $files | Sort-Object FullName -Unique
-
-    if (-not $files -or $files.Count -eq 0) {
-        throw "バックアップ対象ファイルが見つかりませんでした。"
-    }
-
-    Write-Host "Backup files:"
-    foreach ($file in $files) {
-        Write-Host "  $($file.Name)"
-        Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $tempRoot $file.Name) -Force
-    }
-
-    # メモ情報も一緒に入れる
-    $manifest = Join-Path $tempRoot "_backup_manifest.txt"
-    @(
-        "DropMp3 backup"
-        "Created : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-        "Source  : $targetPath"
-        "Output  : $zipPath"
-        ""
-        "Files:"
-        ($files | ForEach-Object { " - $($_.Name)  $($_.Length) bytes  $($_.LastWriteTime.ToString('yyyy-MM-dd HH:mm:ss'))" })
-    ) | Set-Content -LiteralPath $manifest -Encoding UTF8
-
-    # 既存ZIPがあれば消す
-    if (Test-Path -LiteralPath $zipPath) {
-        Remove-Item -LiteralPath $zipPath -Force
-    }
-
-    Compress-Archive -Path (Join-Path $tempRoot "*") -DestinationPath $zipPath -CompressionLevel Optimal
-
-    Write-Host ""
-    Write-Host "Backup complete."
-    Write-Host $zipPath
-}
-finally {
-    if (Test-Path -LiteralPath $tempRoot) {
-        Remove-Item -LiteralPath $tempRoot -Recurse -Force
-    }
-}
+$appName = Split-Path -Leaf $PSScriptRoot
+Invoke-ProjectBackup -ProjectRoot $PSScriptRoot -AppName $appName -Target $Target -Bump:$Bump -SetVersion $SetVersion -Preview:$Preview

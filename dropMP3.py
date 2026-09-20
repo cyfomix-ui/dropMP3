@@ -28,6 +28,9 @@ from PySide6.QtCore import (
     QUrl,
     QTimer,
     QSettings,
+    QBuffer,
+    QFile,
+    QIODevice,
     qInstallMessageHandler,
     QtMsgType,
     QObject,
@@ -112,11 +115,33 @@ LIST_FILE_EXTS = PLAYLIST_EXTS | TEXT_PLAYLIST_EXTS
 APP_START_MONO = time.perf_counter()
 APP_NAME = "DropMP3"
 APP_GITHUB_REPO = "cyfomix-ui/dropMP3"
-APP_VERSION_FALLBACK = "1.00"
+APP_VERSION_FALLBACK = "1.11"
 APP_VERSION_FILE = "_conf/app_version.xml"
 APP_VERSION_LEGACY_FILE = "_conf/app_version.json"
 APP_UPDATE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
 APP_UPDATE_TIMEOUT_SEC = 15
+MEMORY_PRELOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def configure_windows_playback_priority() -> None:
+    """Reduce decoder starvation when another application starts under heavy load."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.SetPriorityClass.restype = ctypes.c_int
+        process = kernel32.GetCurrentProcess()
+        above_normal_priority_class = 0x00008000
+        if not kernel32.SetPriorityClass(process, above_normal_priority_class):
+            raise ctypes.WinError(ctypes.get_last_error())
+        app_log("[AUDIO] Windows process priority set to ABOVE_NORMAL")
+    except Exception as exc:
+        app_log(f"[AUDIO] Windows process priority setup failed: {exc}")
 
 
 def app_resource_dir() -> Path:
@@ -136,17 +161,38 @@ def app_data_dir() -> Path:
 
 
 def read_app_version(base_dir: Path | None = None) -> str:
+    candidate_dirs: list[Path] = []
     if base_dir is not None:
-        version_path = Path(base_dir) / APP_VERSION_FILE
+        candidate_dirs.append(Path(base_dir))
+    try:
+        if hasattr(sys, "_MEIPASS"):
+            candidate_dirs.append(Path(sys._MEIPASS))
+    except Exception:
+        pass
+    try:
+        candidate_dirs.append(Path(__file__).resolve().parent)
+    except Exception:
+        pass
+
+    unique_dirs: list[Path] = []
+    seen: set[str] = set()
+    for candidate_dir in candidate_dirs:
+        key = str(candidate_dir.resolve()).casefold()
+        if key not in seen:
+            seen.add(key)
+            unique_dirs.append(candidate_dir)
+
+    for candidate_dir in unique_dirs:
+        version_path = candidate_dir / APP_VERSION_FILE
         try:
             if version_path.exists():
                 root = ET.fromstring(version_path.read_text(encoding="utf-8"))
                 value = str(root.findtext("version", "") or "").strip()
                 if value:
-                    return value
+                    return normalize_version_text(value)
         except Exception as exc:
-            app_log(f"[UPDATE] version file read failed: {exc}")
-        legacy_path = Path(base_dir) / APP_VERSION_LEGACY_FILE
+            app_log(f"[UPDATE] version file read failed ({version_path}): {exc}")
+        legacy_path = candidate_dir / APP_VERSION_LEGACY_FILE
         try:
             if legacy_path.exists():
                 payload = json.loads(legacy_path.read_text(encoding="utf-8"))
@@ -154,7 +200,7 @@ def read_app_version(base_dir: Path | None = None) -> str:
                 if value:
                     return normalize_version_text(value)
         except Exception as exc:
-            app_log(f"[UPDATE] legacy version file read failed: {exc}")
+            app_log(f"[UPDATE] legacy version file read failed ({legacy_path}): {exc}")
     return APP_VERSION_FALLBACK
 
 
@@ -528,6 +574,27 @@ def T(text: str) -> str:
     return _UI_TRANSLATIONS_EN.get(text, text)
 
 
+def prepare_popup_menu(menu: QMenu, feature: str, *, version_text: str | None = None, stylesheet: str = "") -> None:
+    if stylesheet:
+        menu.setStyleSheet(stylesheet)
+    for action in list(menu.actions()):
+        if bool(action.property("unifiedMenuTitle")):
+            menu.removeAction(action)
+            action.deleteLater()
+    title = f"DropMp3 Ver {version_text}" if version_text else f"DropMp3 {feature}"
+    first = menu.actions()[0] if menu.actions() else None
+    title_action = QAction(title, menu)
+    menu.insertAction(first, title_action)
+    title_action.setEnabled(False)
+    title_action.setProperty("unifiedMenuTitle", True)
+    separator = menu.insertSeparator(first)
+    separator.setProperty("unifiedMenuTitle", True)
+    for action in list(menu.actions()):
+        submenu = action.menu()
+        if submenu is not None:
+            prepare_popup_menu(submenu, action.text().replace("&", "").strip() or feature, stylesheet=stylesheet)
+
+
 class StartupSplash(QWidget):
     """Small startup window that shows visible boot progress until the main UI appears."""
 
@@ -560,6 +627,11 @@ class StartupSplash(QWidget):
                 font-family: Consolas, 'Yu Gothic UI', monospace;
                 font-size: 11px;
             }
+            QLabel#splashVersion {
+                color: #aeb7c6;
+                font-size: 12px;
+                font-weight: 600;
+            }
             QProgressBar {
                 border: 1px solid #343b4c;
                 border-radius: 5px;
@@ -578,7 +650,7 @@ class StartupSplash(QWidget):
         layout.setContentsMargins(28, 24, 28, 24)
         layout.setSpacing(10)
 
-        self.title_label = QLabel(f"DropMp3 {format_version_label(self.app_version)}")
+        self.title_label = QLabel("DropMp3")
         self.title_label.setObjectName("splashTitle")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.title_label)
@@ -593,11 +665,21 @@ class StartupSplash(QWidget):
         self.progress.setValue(3)
         layout.addWidget(self.progress)
 
-        self.log_label = QLabel(f"DropMp3 {format_version_label(self.app_version)}")
+        bottom_layout = QHBoxLayout()
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(12)
+
+        self.log_label = QLabel("")
         self.log_label.setObjectName("splashLog")
         self.log_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         self.log_label.setWordWrap(True)
-        layout.addWidget(self.log_label, 1)
+        bottom_layout.addWidget(self.log_label, 1)
+
+        self.version_label = QLabel(f"Version {self.app_version}")
+        self.version_label.setObjectName("splashVersion")
+        self.version_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+        bottom_layout.addWidget(self.version_label, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
+        layout.addLayout(bottom_layout, 1)
 
         screen = QApplication.primaryScreen()
         if screen:
@@ -609,7 +691,7 @@ class StartupSplash(QWidget):
             self.progress.setValue(max(0, min(100, int(percent))))
         translated = T(message)
         self.status_label.setText(translated)
-        current = self.log_label.text().splitlines()[-5:]
+        current = self.log_label.text().splitlines()[-4:]
         current.append(f"{datetime.now().strftime('%H:%M:%S')}  {translated}")
         self.log_label.setText("\n".join(current))
         app = QApplication.instance()
@@ -2057,6 +2139,8 @@ class MiniDropPlayer(QWidget):
         self._saving_settings = False
         self._last_subtitle_control_state = None
         self._last_art_render_key = None
+        self.media_memory_buffer: QBuffer | None = None
+        self.retired_media_buffers: list[QBuffer] = []
 
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
@@ -2120,6 +2204,57 @@ class MiniDropPlayer(QWidget):
         self.autosave_timer.start(30000)
         self.update_startup_splash("起動完了", 96)
         app_log("MiniDropPlayer init complete")
+
+    def set_media_source(self, path: Path) -> None:
+        """Load ordinary audio files into RAM to isolate playback from storage spikes."""
+        path = Path(path)
+        previous_buffer = self.media_memory_buffer
+        self.media_memory_buffer = None
+
+        try:
+            file_size = path.stat().st_size
+            if file_size <= 0:
+                raise OSError("empty audio file")
+            if file_size > MEMORY_PRELOAD_MAX_BYTES:
+                raise OSError(
+                    f"file is larger than the {MEMORY_PRELOAD_MAX_BYTES // (1024 ** 3)} GiB preload limit"
+                )
+
+            source_file = QFile(str(path))
+            if not source_file.open(QIODevice.OpenModeFlag.ReadOnly):
+                raise OSError(source_file.errorString() or "QFile.open failed")
+            try:
+                audio_data = source_file.readAll()
+            finally:
+                source_file.close()
+            if audio_data.size() != file_size:
+                raise OSError(f"short read: expected={file_size}, actual={audio_data.size()}")
+
+            memory_buffer = QBuffer(self)
+            memory_buffer.setData(audio_data)
+            if not memory_buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+                raise OSError(memory_buffer.errorString() or "QBuffer.open failed")
+
+            self.media_memory_buffer = memory_buffer
+            self.player.setSourceDevice(memory_buffer, QUrl.fromLocalFile(str(path)))
+            app_log(f"[AUDIO] RAM preload enabled: {file_size / (1024 * 1024):.1f} MiB, file={path}")
+        except Exception as exc:
+            app_log(f"[AUDIO] RAM preload unavailable; using file source: {exc}, file={path}")
+            self.player.setSource(QUrl.fromLocalFile(str(path)))
+
+        if previous_buffer is not None:
+            # Qt may finish releasing the old source asynchronously. Keep it alive until
+            # the new source reaches a stable media state.
+            self.retired_media_buffers.append(previous_buffer)
+
+    def release_retired_media_buffers(self) -> None:
+        retired, self.retired_media_buffers = self.retired_media_buffers, []
+        for memory_buffer in retired:
+            try:
+                memory_buffer.close()
+                memory_buffer.deleteLater()
+            except Exception:
+                pass
 
     def update_startup_splash(self, message: str, percent: int | None = None):
         splash = getattr(self, "startup_splash", None)
@@ -2305,6 +2440,7 @@ class MiniDropPlayer(QWidget):
         exit_action = QAction(T("終了"), self)
         exit_action.triggered.connect(self.exit_application)
         menu.addAction(exit_action)
+        prepare_popup_menu(menu, "トレイメニュー", version_text=normalize_version_text(self.current_app_version), stylesheet=self.menu_style())
 
     def tray_playlist_preview_indices(self) -> list[int]:
         if not self.playlist:
@@ -3227,7 +3363,7 @@ class MiniDropPlayer(QWidget):
         app_log(f"Play index={index}, autoplay={autoplay}, restore_position={format_ms(restore_position)}, file={path}")
         self.pending_restore_position = int(restore_position or 0)
         self.restored_once = False
-        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.set_media_source(path)
         self.update_current_title_labels()
         self.update_random_art_pool()
         has_original_art = self.load_album_art(path)
@@ -3260,7 +3396,7 @@ class MiniDropPlayer(QWidget):
         app_log(f"One-shot play: {path}")
         self.pending_restore_position = 0
         self.restored_once = False
-        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.set_media_source(path)
         title = self.get_display_title(path)
         self.one_shot_name_label.setText(title)
         self.art_title_label.setText(title)
@@ -3286,7 +3422,7 @@ class MiniDropPlayer(QWidget):
         path = self.playlist[self.current_index]
         self.pending_restore_position = max(0, int(self.one_shot_return_position or 0))
         self.restored_once = False
-        self.player.setSource(QUrl.fromLocalFile(str(path)))
+        self.set_media_source(path)
         self.update_current_title_labels()
         self.art_title_label.setText(self.get_display_title(path))
         has_original_art = self.load_album_art(path)
@@ -3362,6 +3498,13 @@ class MiniDropPlayer(QWidget):
 
     def on_media_status_changed(self, status):
         app_log(f"Media status changed: {status}")
+        if status in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+            QMediaPlayer.MediaStatus.InvalidMedia,
+            QMediaPlayer.MediaStatus.NoMedia,
+        ):
+            self.release_retired_media_buffers()
         if status == QMediaPlayer.EndOfMedia:
             if self.one_shot_path is not None:
                 app_log("End of one-shot media; normal playback will resume after 0.3 sec")
@@ -5201,6 +5344,7 @@ Start-Process -FilePath $exePath
         menu.addAction(update_action)
 
         pos = global_pos if global_pos is not None else self.gear_button.mapToGlobal(self.gear_button.rect().bottomLeft())
+        prepare_popup_menu(menu, T("設定"), stylesheet=self.menu_style())
         menu.exec(pos)
 
     def help_label(self, ja: str, en: str) -> str:
@@ -5223,6 +5367,7 @@ Start-Process -FilePath $exePath
         menu.addAction(install_action)
 
         pos = global_pos if global_pos is not None else self.help_button.mapToGlobal(self.help_button.rect().bottomLeft())
+        prepare_popup_menu(menu, "Help", stylesheet=self.menu_style())
         menu.exec(pos)
 
     def position_dialog_above_tray(self, dialog: QDialog):
@@ -5361,6 +5506,7 @@ Start-Process -FilePath $exePath
                 self.playlist_popup_menu = None
 
         menu.aboutToHide.connect(clear_popup_ref)
+        prepare_popup_menu(menu, T("再生リスト"), stylesheet=self.menu_style())
         menu.popup(self.tray_menu_popup_pos())
 
     def play_playlist_window_index(self, index: int):
@@ -5861,6 +6007,7 @@ Start-Process -FilePath $exePath
         exit_action.triggered.connect(self.exit_application)
         menu.addAction(exit_action)
 
+        prepare_popup_menu(menu, T("プレイリスト操作"), stylesheet=self.menu_style())
         menu.exec(global_pos)
 
     def delete_playlist_index(self, index: int):
@@ -6605,10 +6752,11 @@ Start-Process -FilePath $exePath
 
     def menu_style(self):
         return """
-            QMenu { background-color:#151515; color:white; border:1px solid #333; font-size:13px; }
-            QMenu::item { padding:6px 24px 6px 24px; }
-            QMenu::item:selected { background-color:#333333; }
-            QMenu::separator { height:1px; background:#505050; margin:6px 4px; }
+            QMenu { background-color:#202124; color:#f5f5f5; border:1px solid #50545e; font-family:"Yu Gothic UI","Meiryo UI","Segoe UI"; font-size:12pt; }
+            QMenu::item { padding:7px 24px 7px 12px; }
+            QMenu::item:selected { background-color:#3c4658; color:#ffffff; }
+            QMenu::item:disabled { color:#9aa0a6; }
+            QMenu::separator { height:1px; background:#50545e; margin:5px 8px; }
         """
 
     def contextMenuEvent(self, event):
@@ -6663,6 +6811,7 @@ Start-Process -FilePath $exePath
         exit_action = QAction(T("終了"), self)
         exit_action.triggered.connect(self.exit_application)
         menu.addAction(exit_action)
+        prepare_popup_menu(menu, T("Player操作"), stylesheet=self.menu_style())
         menu.exec(event.globalPos())
 
     def exit_application(self):
@@ -7141,6 +7290,7 @@ Start-Process -FilePath $exePath
 
 
 def main():
+    configure_windows_playback_priority()
     startup_audio_files = collect_startup_audio_files(sys.argv[1:])
     if startup_audio_files and try_forward_one_shot_to_existing_instance(startup_audio_files):
         return
