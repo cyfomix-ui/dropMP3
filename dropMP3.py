@@ -29,7 +29,7 @@ from PySide6.QtCore import (
     QTimer,
     QSettings,
     QBuffer,
-    QFile,
+    QByteArray,
     QIODevice,
     qInstallMessageHandler,
     QtMsgType,
@@ -115,12 +115,13 @@ LIST_FILE_EXTS = PLAYLIST_EXTS | TEXT_PLAYLIST_EXTS
 APP_START_MONO = time.perf_counter()
 APP_NAME = "DropMP3"
 APP_GITHUB_REPO = "cyfomix-ui/dropMP3"
-APP_VERSION_FALLBACK = "1.11"
+APP_VERSION_FALLBACK = "1.12"
 APP_VERSION_FILE = "_conf/app_version.xml"
 APP_VERSION_LEGACY_FILE = "_conf/app_version.json"
 APP_UPDATE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
 APP_UPDATE_TIMEOUT_SEC = 15
-MEMORY_PRELOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024
+MEMORY_PRELOAD_MAX_BYTES = 512 * 1024 * 1024
+MEMORY_PRELOAD_CHUNK_BYTES = 4 * 1024 * 1024
 
 
 def configure_windows_playback_priority() -> None:
@@ -142,6 +143,36 @@ def configure_windows_playback_priority() -> None:
         app_log("[AUDIO] Windows process priority set to ABOVE_NORMAL")
     except Exception as exc:
         app_log(f"[AUDIO] Windows process priority setup failed: {exc}")
+
+
+def read_media_for_preload(path: Path, cancel_event: threading.Event) -> tuple[bytes | None, str]:
+    """Read media off the GUI thread, allowing superseded requests to stop early."""
+    try:
+        file_size = path.stat().st_size
+        if file_size <= 0:
+            return None, "empty audio file"
+        if file_size > MEMORY_PRELOAD_MAX_BYTES:
+            return None, f"file exceeds the {MEMORY_PRELOAD_MAX_BYTES // (1024 ** 2)} MiB preload limit"
+
+        chunks: list[bytes] = []
+        bytes_read = 0
+        with path.open("rb") as source_file:
+            while True:
+                if cancel_event.is_set():
+                    return None, "canceled"
+                chunk = source_file.read(MEMORY_PRELOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                bytes_read += len(chunk)
+
+        if bytes_read != file_size:
+            return None, f"short read: expected={file_size}, actual={bytes_read}"
+        if cancel_event.is_set():
+            return None, "canceled"
+        return b"".join(chunks), ""
+    except Exception as exc:
+        return None, str(exc)
 
 
 def app_resource_dir() -> Path:
@@ -2028,6 +2059,10 @@ class SeekStepButton(QPushButton):
         painter.drawText(self.rect().adjusted(0, text_top, 0, text_bottom), Qt.AlignCenter, str(self.seconds))
 
 
+class MediaPreloadBridge(QObject):
+    completed = Signal(object)
+
+
 class MiniDropPlayer(QWidget):
     WIDE_PLAYLIST_THRESHOLD = 860
     SEEK_STEP_MS = 10000
@@ -2141,6 +2176,15 @@ class MiniDropPlayer(QWidget):
         self._last_art_render_key = None
         self.media_memory_buffer: QBuffer | None = None
         self.retired_media_buffers: list[QBuffer] = []
+        self.media_preload_bridge = MediaPreloadBridge(self)
+        self.media_preload_bridge.completed.connect(
+            self.on_media_preload_completed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.media_preload_request_id = 0
+        self.media_preload_cancel_event: threading.Event | None = None
+        self.pending_media_autoplay = False
+        self.pending_media_path: Path | None = None
 
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
@@ -2205,47 +2249,67 @@ class MiniDropPlayer(QWidget):
         self.update_startup_splash("起動完了", 96)
         app_log("MiniDropPlayer init complete")
 
-    def set_media_source(self, path: Path) -> None:
-        """Load ordinary audio files into RAM to isolate playback from storage spikes."""
+    def set_media_source(self, path: Path, *, autoplay: bool) -> None:
+        """Queue RAM preloading without blocking Qt's GUI event loop."""
         path = Path(path)
+        self.media_preload_request_id += 1
+        request_id = self.media_preload_request_id
+        if self.media_preload_cancel_event is not None:
+            self.media_preload_cancel_event.set()
+        cancel_event = threading.Event()
+        self.media_preload_cancel_event = cancel_event
+        self.pending_media_autoplay = bool(autoplay)
+        self.pending_media_path = path
+
         previous_buffer = self.media_memory_buffer
         self.media_memory_buffer = None
+        if previous_buffer is not None:
+            self.retired_media_buffers.append(previous_buffer)
+        self.player.stop()
+        self.player.setSource(QUrl())
+        app_log(f"[AUDIO] RAM preload queued: request={request_id}, file={path}")
 
-        try:
-            file_size = path.stat().st_size
-            if file_size <= 0:
-                raise OSError("empty audio file")
-            if file_size > MEMORY_PRELOAD_MAX_BYTES:
-                raise OSError(
-                    f"file is larger than the {MEMORY_PRELOAD_MAX_BYTES // (1024 ** 3)} GiB preload limit"
-                )
-
-            source_file = QFile(str(path))
-            if not source_file.open(QIODevice.OpenModeFlag.ReadOnly):
-                raise OSError(source_file.errorString() or "QFile.open failed")
+        def worker() -> None:
+            started = time.perf_counter()
+            audio_data, error = read_media_for_preload(path, cancel_event)
+            elapsed_ms = (time.perf_counter() - started) * 1000
             try:
-                audio_data = source_file.readAll()
-            finally:
-                source_file.close()
-            if audio_data.size() != file_size:
-                raise OSError(f"short read: expected={file_size}, actual={audio_data.size()}")
+                self.media_preload_bridge.completed.emit((request_id, path, audio_data, error, elapsed_ms))
+            except RuntimeError:
+                pass
 
+        threading.Thread(target=worker, name=f"DropMP3Preload-{request_id}", daemon=True).start()
+
+    def on_media_preload_completed(self, result: tuple) -> None:
+        request_id, path, audio_data, error, elapsed_ms = result
+        if request_id != self.media_preload_request_id or path != self.pending_media_path:
+            app_log(f"[AUDIO] Discarded stale preload: request={request_id}, file={path}")
+            return
+
+        self.media_preload_cancel_event = None
+        if audio_data is not None:
             memory_buffer = QBuffer(self)
-            memory_buffer.setData(audio_data)
-            if not memory_buffer.open(QIODevice.OpenModeFlag.ReadOnly):
-                raise OSError(memory_buffer.errorString() or "QBuffer.open failed")
+            memory_buffer.setData(QByteArray(audio_data))
+            if memory_buffer.open(QIODevice.OpenModeFlag.ReadOnly):
+                self.media_memory_buffer = memory_buffer
+                self.player.setSourceDevice(memory_buffer, QUrl.fromLocalFile(str(path)))
+                app_log(
+                    f"[AUDIO] RAM preload enabled: {len(audio_data) / (1024 * 1024):.1f} MiB, "
+                    f"{elapsed_ms:.1f} ms, file={path}"
+                )
+            else:
+                error = memory_buffer.errorString() or "QBuffer.open failed"
+                memory_buffer.deleteLater()
+                audio_data = None
 
-            self.media_memory_buffer = memory_buffer
-            self.player.setSourceDevice(memory_buffer, QUrl.fromLocalFile(str(path)))
-            app_log(f"[AUDIO] RAM preload enabled: {file_size / (1024 * 1024):.1f} MiB, file={path}")
-        except Exception as exc:
-            app_log(f"[AUDIO] RAM preload unavailable; using file source: {exc}, file={path}")
+        if audio_data is None:
+            app_log(f"[AUDIO] RAM preload unavailable; using file source: {error}, file={path}")
             self.player.setSource(QUrl.fromLocalFile(str(path)))
 
-        if previous_buffer is not None:
-            # Qt may finish releasing the old source asynchronously. Keep it alive until
-            # the new source reaches a stable media state.
-            self.retired_media_buffers.append(previous_buffer)
+        if self.pending_media_autoplay:
+            self.player.play()
+        else:
+            self.player.pause()
 
     def release_retired_media_buffers(self) -> None:
         retired, self.retired_media_buffers = self.retired_media_buffers, []
@@ -3363,7 +3427,7 @@ class MiniDropPlayer(QWidget):
         app_log(f"Play index={index}, autoplay={autoplay}, restore_position={format_ms(restore_position)}, file={path}")
         self.pending_restore_position = int(restore_position or 0)
         self.restored_once = False
-        self.set_media_source(path)
+        self.set_media_source(path, autoplay=autoplay)
         self.update_current_title_labels()
         self.update_random_art_pool()
         has_original_art = self.load_album_art(path)
@@ -3374,10 +3438,6 @@ class MiniDropPlayer(QWidget):
         else:
             self.update_playlist_playing_items(previous_index, index)
         self.update_left_panel_visibility()
-        if autoplay:
-            self.player.play()
-        else:
-            self.player.pause()
         self.save_settings()
 
     def play_one_shot(self, path: Path, enter_panel: bool = True):
@@ -3396,7 +3456,7 @@ class MiniDropPlayer(QWidget):
         app_log(f"One-shot play: {path}")
         self.pending_restore_position = 0
         self.restored_once = False
-        self.set_media_source(path)
+        self.set_media_source(path, autoplay=True)
         title = self.get_display_title(path)
         self.one_shot_name_label.setText(title)
         self.art_title_label.setText(title)
@@ -3405,7 +3465,6 @@ class MiniDropPlayer(QWidget):
         self.prepare_random_art_for_current_track(has_original_art)
         self.load_subtitles_for(path)
         self.refresh_playlist_window()
-        self.player.play()
         self.save_settings()
 
     def restore_after_one_shot(self):
@@ -3422,20 +3481,20 @@ class MiniDropPlayer(QWidget):
         path = self.playlist[self.current_index]
         self.pending_restore_position = max(0, int(self.one_shot_return_position or 0))
         self.restored_once = False
-        self.set_media_source(path)
+        self.set_media_source(path, autoplay=self.one_shot_return_was_playing)
         self.update_current_title_labels()
         self.art_title_label.setText(self.get_display_title(path))
         has_original_art = self.load_album_art(path)
         self.prepare_random_art_for_current_track(has_original_art)
         self.load_subtitles_for(path)
         self.update_playlist_panel()
-        if self.one_shot_return_was_playing:
-            self.player.play()
-        else:
-            self.player.pause()
         self.save_settings()
 
     def toggle_play(self):
+        if self.media_preload_cancel_event is not None:
+            self.pending_media_autoplay = not self.pending_media_autoplay
+            app_log(f"Preload pending; autoplay={'ON' if self.pending_media_autoplay else 'OFF'}")
+            return
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             app_log("Pause")
             self.player.pause()
@@ -6817,6 +6876,8 @@ Start-Process -FilePath $exePath
     def exit_application(self):
         app_log("Exit selected")
         self.exit_requested = True
+        if self.media_preload_cancel_event is not None:
+            self.media_preload_cancel_event.set()
         self.shutdown_remote_control()
         self.save_settings()
         if self.tray_icon is not None:
@@ -7271,6 +7332,8 @@ Start-Process -FilePath $exePath
             return
 
         app_log("Application closing by explicit exit")
+        if self.media_preload_cancel_event is not None:
+            self.media_preload_cancel_event.set()
         self.shutdown_remote_control()
         self.save_settings()
         try:
