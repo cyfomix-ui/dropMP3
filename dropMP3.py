@@ -1,4 +1,4 @@
-import sys
+﻿import sys
 import os
 import json
 import time
@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 import urllib.error
 import urllib.request
 import urllib.parse
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from html import escape
@@ -28,9 +29,6 @@ from PySide6.QtCore import (
     QUrl,
     QTimer,
     QSettings,
-    QBuffer,
-    QByteArray,
-    QIODevice,
     qInstallMessageHandler,
     QtMsgType,
     QObject,
@@ -102,6 +100,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 
 from mutagen import File as MutagenFile
+from audio_process import AudioProcessPlayer
 
 
 AUDIO_EXTS = {
@@ -115,13 +114,11 @@ LIST_FILE_EXTS = PLAYLIST_EXTS | TEXT_PLAYLIST_EXTS
 APP_START_MONO = time.perf_counter()
 APP_NAME = "DropMP3"
 APP_GITHUB_REPO = "cyfomix-ui/dropMP3"
-APP_VERSION_FALLBACK = "1.12"
+APP_VERSION_FALLBACK = "1.18"
 APP_VERSION_FILE = "_conf/app_version.xml"
 APP_VERSION_LEGACY_FILE = "_conf/app_version.json"
 APP_UPDATE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
 APP_UPDATE_TIMEOUT_SEC = 15
-MEMORY_PRELOAD_MAX_BYTES = 512 * 1024 * 1024
-MEMORY_PRELOAD_CHUNK_BYTES = 4 * 1024 * 1024
 
 
 def configure_windows_playback_priority() -> None:
@@ -143,36 +140,6 @@ def configure_windows_playback_priority() -> None:
         app_log("[AUDIO] Windows process priority set to ABOVE_NORMAL")
     except Exception as exc:
         app_log(f"[AUDIO] Windows process priority setup failed: {exc}")
-
-
-def read_media_for_preload(path: Path, cancel_event: threading.Event) -> tuple[bytes | None, str]:
-    """Read media off the GUI thread, allowing superseded requests to stop early."""
-    try:
-        file_size = path.stat().st_size
-        if file_size <= 0:
-            return None, "empty audio file"
-        if file_size > MEMORY_PRELOAD_MAX_BYTES:
-            return None, f"file exceeds the {MEMORY_PRELOAD_MAX_BYTES // (1024 ** 2)} MiB preload limit"
-
-        chunks: list[bytes] = []
-        bytes_read = 0
-        with path.open("rb") as source_file:
-            while True:
-                if cancel_event.is_set():
-                    return None, "canceled"
-                chunk = source_file.read(MEMORY_PRELOAD_CHUNK_BYTES)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                bytes_read += len(chunk)
-
-        if bytes_read != file_size:
-            return None, f"short read: expected={file_size}, actual={bytes_read}"
-        if cancel_event.is_set():
-            return None, "canceled"
-        return b"".join(chunks), ""
-    except Exception as exc:
-        return None, str(exc)
 
 
 def app_resource_dir() -> Path:
@@ -1347,6 +1314,7 @@ class ArtLabel(QLabel):
         self._suppress_release_click_once = False
         self._click_timer = QTimer(self)
         self._click_timer.setSingleShot(True)
+        self._click_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._click_timer.timeout.connect(self.clicked.emit)
 
     def mouseDoubleClickEvent(self, event):
@@ -1389,7 +1357,9 @@ class ArtLabel(QLabel):
                 if self._click_timer.isActive():
                     self._click_timer.stop()
             elif not self._moved:
-                self._click_timer.start(220)
+                # A valid OS double click must cancel the single-click pause/play.
+                # A fixed 220ms timeout fires before Windows' usual 500ms limit.
+                self._click_timer.start(QApplication.doubleClickInterval() + 20)
             self._press_pos = None
             self._moved = False
             event.accept()
@@ -1593,20 +1563,30 @@ class SubtitleOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.subtitle_font = QFont(self.font())
         self.subtitle_color = QColor(120, 255, 145, 235)
+        self._render_cache_key = None
+        self._render_cache = QPixmap()
+        self._render_rect = QRect()
+        self.full_area = False
         self.setVisible(False)
+
+    def set_full_area(self, enabled):
+        enabled = bool(enabled)
+        if self.full_area != enabled:
+            self.full_area = enabled
+            self.refresh_subtitle_rendering()
 
     def set_subtitle_style(self, font=None, color=None):
         if font is not None:
             self.subtitle_font = QFont(font)
         if color is not None:
             self.subtitle_color = QColor(color)
-        self.update()
+        self.refresh_subtitle_rendering()
 
     def set_cues(self, cues: list[tuple[int, int, str]]):
         self.cues = cues or []
         self.current_index = -1
         self.setVisible(bool(self.cues))
-        self.update()
+        self.refresh_subtitle_rendering()
 
     def update_position(self, position_ms: int):
         if not self.cues:
@@ -1622,10 +1602,10 @@ class SubtitleOverlay(QWidget):
                 break
         if idx != self.current_index:
             self.current_index = idx
-            self.update()
+            self.refresh_subtitle_rendering()
 
-    def wrapped_lines(self, painter: QPainter, text: str, max_width: int, max_lines: int = 2) -> list[str]:
-        metrics = QFontMetrics(painter.font())
+    def wrapped_lines(self, font: QFont, text: str, max_width: int, max_lines: int = 2) -> list[str]:
+        metrics = QFontMetrics(font)
         if metrics.horizontalAdvance(text) <= max_width:
             return [text]
 
@@ -1648,21 +1628,37 @@ class SubtitleOverlay(QWidget):
             lines = lines[:max_lines]
         return lines
 
-    def paintEvent(self, event):
-        if not self.cues or self.current_index < 0:
+    def refresh_subtitle_rendering(self):
+        previous_rect = QRect(self._render_rect)
+        self._render_cache_key = None
+        if not self.isVisible():
             return
+        self.ensure_subtitle_render_cache()
+        dirty = previous_rect.united(self._render_rect).intersected(self.rect())
+        if not dirty.isEmpty():
+            self.update(dirty)
 
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        font = QFont(getattr(self, "subtitle_font", self.font()))
-        painter.setFont(font)
+    def resizeEvent(self, event):
+        self._render_cache_key = None
+        super().resizeEvent(event)
 
+    def ensure_subtitle_render_cache(self):
+        ratio = self.devicePixelRatioF()
+        key = (self.current_index, self.width(), self.height(), ratio, self.full_area)
+        if key == self._render_cache_key:
+            return
+        self._render_cache_key = key
+        self._render_cache = QPixmap()
+        self._render_rect = QRect()
+        if not self.cues or self.current_index < 0 or self.width() <= 18:
+            return
+        font = QFont(self.subtitle_font)
         indices = [i for i in (self.current_index - 1, self.current_index, self.current_index + 1) if 0 <= i < len(self.cues)]
         rows: list[tuple[bool, str]] = []
         max_width = max(80, self.width() - 28)
         for idx in indices:
             is_current = idx == self.current_index
-            for line in self.wrapped_lines(painter, self.cues[idx][2], max_width, 2):
+            for line in self.wrapped_lines(font, self.cues[idx][2], max_width, 2):
                 rows.append((is_current, line))
 
         # 最大5行。現在字幕が2行化しても見やすいようにする。
@@ -1676,13 +1672,39 @@ class SubtitleOverlay(QWidget):
         box_w = self.width() - 18
         x = 9
         y = max(10, self.height() - box_h - 12)
-
+        if self.full_area:
+            # Use the whole mini-player image and center the current lyric.
+            capacity = max(1, (self.height() - 16) // line_h)
+            current = [(True, line) for line in self.wrapped_lines(
+                font, self.cues[self.current_index][2], max_width, capacity)]
+            previous = []
+            following = []
+            for idx in range(max(0, self.current_index - capacity), self.current_index):
+                previous.extend((False, line) for line in self.wrapped_lines(font, self.cues[idx][2], max_width, capacity))
+            for idx in range(self.current_index + 1, min(len(self.cues), self.current_index + capacity + 1)):
+                following.extend((False, line) for line in self.wrapped_lines(font, self.cues[idx][2], max_width, capacity))
+            before = min(len(previous), max(0, (capacity - len(current)) // 2))
+            after = min(len(following), capacity - len(current) - before)
+            before = min(len(previous), capacity - len(current) - after)
+            rows = (previous[-before:] if before else []) + current + following[:after]
+            x = y = 0
+            box_w, box_h = self.width(), self.height()
+        # Cache only the subtitle band, including the antialiasing fringe.
+        self._render_rect = QRect(x - 2, y - 2, box_w + 4, box_h + 4)
+        self._render_cache = QPixmap(int((box_w + 4) * ratio + 0.999),
+                                     int((box_h + 4) * ratio + 0.999))
+        self._render_cache.setDevicePixelRatio(ratio)
+        self._render_cache.fill(Qt.transparent)
+        painter = QPainter(self._render_cache)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setFont(font)
+        painter.translate(2, 2)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(0, 0, 0, 118))
-        painter.drawRoundedRect(QRect(x, y, box_w, box_h), 8, 8)
+        painter.drawRoundedRect(QRect(0, 0, box_w, box_h), 8, 8)
 
-        text_y = y + 8
-        text_rect_x = x + 12
+        text_y = max(8, (box_h - line_h * len(rows)) // 2) if self.full_area else 8
+        text_rect_x = 12
         text_rect_w = max(10, box_w - 24)
         for is_current, line in rows:
             line_rect = QRect(text_rect_x, text_y, text_rect_w, line_h)
@@ -1696,6 +1718,13 @@ class SubtitleOverlay(QWidget):
             painter.setPen(current_color if is_current else QColor(255, 255, 255, 225))
             painter.drawText(line_rect, Qt.AlignCenter, line)
             text_y += line_h
+        painter.end()
+
+    def paintEvent(self, event):
+        self.ensure_subtitle_render_cache()
+        if not self._render_cache.isNull():
+            painter = QPainter(self)
+            painter.drawPixmap(self._render_rect.topLeft(), self._render_cache)
 
 
 class LogWindow(QWidget):
@@ -2059,10 +2088,6 @@ class SeekStepButton(QPushButton):
         painter.drawText(self.rect().adjusted(0, text_top, 0, text_bottom), Qt.AlignCenter, str(self.seconds))
 
 
-class MediaPreloadBridge(QObject):
-    completed = Signal(object)
-
-
 class MiniDropPlayer(QWidget):
     WIDE_PLAYLIST_THRESHOLD = 860
     SEEK_STEP_MS = 10000
@@ -2125,6 +2150,8 @@ class MiniDropPlayer(QWidget):
         self.restored_once = False
         self.art_source_pixmap = QPixmap()
         self.is_art_only_mode = False
+        self.is_quarter_art_mode = False
+        self.art_only_geometry_before_quarter = None
         self.is_one_shot_panel_mode = False
         self.normal_geometry_before_small_mode = None
         self.dragging_small_window = False
@@ -2174,17 +2201,6 @@ class MiniDropPlayer(QWidget):
         self._saving_settings = False
         self._last_subtitle_control_state = None
         self._last_art_render_key = None
-        self.media_memory_buffer: QBuffer | None = None
-        self.retired_media_buffers: list[QBuffer] = []
-        self.media_preload_bridge = MediaPreloadBridge(self)
-        self.media_preload_bridge.completed.connect(
-            self.on_media_preload_completed,
-            Qt.ConnectionType.QueuedConnection,
-        )
-        self.media_preload_request_id = 0
-        self.media_preload_cancel_event: threading.Event | None = None
-        self.pending_media_autoplay = False
-        self.pending_media_path: Path | None = None
 
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
@@ -2192,6 +2208,10 @@ class MiniDropPlayer(QWidget):
         self.art_resize_timer = QTimer(self)
         self.art_resize_timer.setSingleShot(True)
         self.art_resize_timer.timeout.connect(self.set_art_pixmap)
+        self.splitter_restore_timer = QTimer(self)
+        self.splitter_restore_timer.setSingleShot(True)
+        self.splitter_restore_timer.timeout.connect(self.restore_main_splitter_sizes)
+        self._display_update_in_progress = False
 
         # Header title style: strong Latin font + Japanese-capable fallbacks.
         # Impact is used for English glyphs; Japanese falls back to Yu Gothic UI / Meiryo.
@@ -2210,7 +2230,8 @@ class MiniDropPlayer(QWidget):
         self.current_title_color = "#ffffff"
 
         self.update_startup_splash("メインウィンドウを準備中...", 22)
-        self.player = QMediaPlayer(self)
+        self.player = AudioProcessPlayer(self, app_log)
+        QApplication.instance().aboutToQuit.connect(self.player.shutdown)
         self.audio = QAudioOutput(self)
         self.media_devices = QMediaDevices(self)
         self.player.setAudioOutput(self.audio)
@@ -2250,75 +2271,14 @@ class MiniDropPlayer(QWidget):
         app_log("MiniDropPlayer init complete")
 
     def set_media_source(self, path: Path, *, autoplay: bool) -> None:
-        """Queue RAM preloading without blocking Qt's GUI event loop."""
-        path = Path(path)
-        self.media_preload_request_id += 1
-        request_id = self.media_preload_request_id
-        if self.media_preload_cancel_event is not None:
-            self.media_preload_cancel_event.set()
-        cancel_event = threading.Event()
-        self.media_preload_cancel_event = cancel_event
-        self.pending_media_autoplay = bool(autoplay)
-        self.pending_media_path = path
-
-        previous_buffer = self.media_memory_buffer
-        self.media_memory_buffer = None
-        if previous_buffer is not None:
-            self.retired_media_buffers.append(previous_buffer)
+        """Start from the file immediately; never wait for whole-track preloading."""
         self.player.stop()
-        self.player.setSource(QUrl())
-        app_log(f"[AUDIO] RAM preload queued: request={request_id}, file={path}")
-
-        def worker() -> None:
-            started = time.perf_counter()
-            audio_data, error = read_media_for_preload(path, cancel_event)
-            elapsed_ms = (time.perf_counter() - started) * 1000
-            try:
-                self.media_preload_bridge.completed.emit((request_id, path, audio_data, error, elapsed_ms))
-            except RuntimeError:
-                pass
-
-        threading.Thread(target=worker, name=f"DropMP3Preload-{request_id}", daemon=True).start()
-
-    def on_media_preload_completed(self, result: tuple) -> None:
-        request_id, path, audio_data, error, elapsed_ms = result
-        if request_id != self.media_preload_request_id or path != self.pending_media_path:
-            app_log(f"[AUDIO] Discarded stale preload: request={request_id}, file={path}")
-            return
-
-        self.media_preload_cancel_event = None
-        if audio_data is not None:
-            memory_buffer = QBuffer(self)
-            memory_buffer.setData(QByteArray(audio_data))
-            if memory_buffer.open(QIODevice.OpenModeFlag.ReadOnly):
-                self.media_memory_buffer = memory_buffer
-                self.player.setSourceDevice(memory_buffer, QUrl.fromLocalFile(str(path)))
-                app_log(
-                    f"[AUDIO] RAM preload enabled: {len(audio_data) / (1024 * 1024):.1f} MiB, "
-                    f"{elapsed_ms:.1f} ms, file={path}"
-                )
-            else:
-                error = memory_buffer.errorString() or "QBuffer.open failed"
-                memory_buffer.deleteLater()
-                audio_data = None
-
-        if audio_data is None:
-            app_log(f"[AUDIO] RAM preload unavailable; using file source: {error}, file={path}")
-            self.player.setSource(QUrl.fromLocalFile(str(path)))
-
-        if self.pending_media_autoplay:
+        self.player.setSource(QUrl.fromLocalFile(str(Path(path))))
+        app_log(f"[AUDIO] Direct file playback: {path}")
+        if autoplay:
             self.player.play()
         else:
             self.player.pause()
-
-    def release_retired_media_buffers(self) -> None:
-        retired, self.retired_media_buffers = self.retired_media_buffers, []
-        for memory_buffer in retired:
-            try:
-                memory_buffer.close()
-                memory_buffer.deleteLater()
-            except Exception:
-                pass
 
     def update_startup_splash(self, message: str, percent: int | None = None):
         splash = getattr(self, "startup_splash", None)
@@ -2606,7 +2566,7 @@ class MiniDropPlayer(QWidget):
         if self.is_one_shot_panel_mode:
             self.settings.setValue("one_shot_geometry", self.geometry())
         elif self.is_art_only_mode:
-            self.settings.setValue("art_only_geometry", self.geometry())
+            self.save_art_only_geometry()
 
         self.save_settings()
         self.hide_auxiliary_windows_for_tray()
@@ -3431,8 +3391,8 @@ class MiniDropPlayer(QWidget):
         self.update_current_title_labels()
         self.update_random_art_pool()
         has_original_art = self.load_album_art(path)
-        self.prepare_random_art_for_current_track(has_original_art)
         self.load_subtitles_for(path)
+        self.prepare_random_art_for_current_track(has_original_art)
         if refresh_playlist:
             self.update_playlist_panel()
         else:
@@ -3462,8 +3422,8 @@ class MiniDropPlayer(QWidget):
         self.art_title_label.setText(title)
         self.title_label.setText("[OneShot] " + title)
         has_original_art = self.load_album_art(path)
-        self.prepare_random_art_for_current_track(has_original_art)
         self.load_subtitles_for(path)
+        self.prepare_random_art_for_current_track(has_original_art)
         self.refresh_playlist_window()
         self.save_settings()
 
@@ -3485,16 +3445,12 @@ class MiniDropPlayer(QWidget):
         self.update_current_title_labels()
         self.art_title_label.setText(self.get_display_title(path))
         has_original_art = self.load_album_art(path)
-        self.prepare_random_art_for_current_track(has_original_art)
         self.load_subtitles_for(path)
+        self.prepare_random_art_for_current_track(has_original_art)
         self.update_playlist_panel()
         self.save_settings()
 
     def toggle_play(self):
-        if self.media_preload_cancel_event is not None:
-            self.pending_media_autoplay = not self.pending_media_autoplay
-            app_log(f"Preload pending; autoplay={'ON' if self.pending_media_autoplay else 'OFF'}")
-            return
         if self.player.playbackState() == QMediaPlayer.PlayingState:
             app_log("Pause")
             self.player.pause()
@@ -3557,13 +3513,6 @@ class MiniDropPlayer(QWidget):
 
     def on_media_status_changed(self, status):
         app_log(f"Media status changed: {status}")
-        if status in (
-            QMediaPlayer.MediaStatus.LoadedMedia,
-            QMediaPlayer.MediaStatus.BufferedMedia,
-            QMediaPlayer.MediaStatus.InvalidMedia,
-            QMediaPlayer.MediaStatus.NoMedia,
-        ):
-            self.release_retired_media_buffers()
         if status == QMediaPlayer.EndOfMedia:
             if self.one_shot_path is not None:
                 app_log("End of one-shot media; normal playback will resume after 0.3 sec")
@@ -3609,7 +3558,7 @@ class MiniDropPlayer(QWidget):
         self.position_slider.setRange(0, max(0, duration))
         self.total_time_label.setText(format_ms(duration))
         self.update_small_time_label(self.player.position(), duration)
-        if self.pending_restore_position > 0 and not self.restored_once:
+        if duration > 0 and self.pending_restore_position > 0 and not self.restored_once:
             pos = min(self.pending_restore_position, max(0, duration - 1000))
             app_log(f"Restore playback position: {format_ms(pos)} ({pos} ms)")
             QTimer.singleShot(200, lambda: self.player.setPosition(pos))
@@ -3620,9 +3569,10 @@ class MiniDropPlayer(QWidget):
         self.update_small_time_label(position, self.player.duration())
         self.subtitle_overlay.update_position(position)
         self.subtitle_overlay.setVisible(
-            self.subtitle_overlay.current_index >= 0
+            bool(self.subtitle_overlay.cues)
             and self.subtitle_display_mode != 0
             and not self.subtitles_manually_hidden
+            and not self.is_quarter_art_mode
         )
         if not self.user_is_seeking:
             self.position_slider.setValue(position)
@@ -3642,9 +3592,10 @@ class MiniDropPlayer(QWidget):
         self.update_small_time_label(position, self.player.duration())
         self.subtitle_overlay.update_position(position)
         self.subtitle_overlay.setVisible(
-            self.subtitle_overlay.current_index >= 0
+            bool(self.subtitle_overlay.cues)
             and self.subtitle_display_mode != 0
             and not self.subtitles_manually_hidden
+            and not self.is_quarter_art_mode
         )
 
     def on_seek_end(self):
@@ -3723,7 +3674,7 @@ class MiniDropPlayer(QWidget):
         """)
         self.stop_random_art_mode(hide_notice=True)
         self.update_random_art_pool()
-        if not self.random_art_enabled:
+        if not self.random_art_enabled or self.track_has_lyrics():
             return
         if not self.random_art_paths:
             return
@@ -3735,7 +3686,7 @@ class MiniDropPlayer(QWidget):
             self.start_random_art_mode()
 
     def start_random_art_mode(self):
-        if not self.random_art_enabled:
+        if not self.random_art_enabled or self.track_has_lyrics():
             self.stop_random_art_mode(hide_notice=True)
             self.restore_original_album_art()
             return
@@ -3751,7 +3702,7 @@ class MiniDropPlayer(QWidget):
             self.random_art_timer.start(20000)
 
     def show_random_playlist_art(self):
-        if not self.random_art_enabled:
+        if not self.random_art_enabled or self.track_has_lyrics():
             self.stop_random_art_mode(hide_notice=True)
             self.restore_original_album_art()
             return
@@ -3806,6 +3757,9 @@ class MiniDropPlayer(QWidget):
 
     def resume_random_art_timers_for_playback_play(self):
         T("""再生再開時に、停止していたランダム画像の自動切替を再開する。""")
+        if self.track_has_lyrics():
+            self.stop_random_art_mode(hide_notice=True)
+            return
         if not self.random_art_enabled:
             self.random_art_delay_paused = False
             self.random_art_timer_paused = False
@@ -4503,10 +4457,16 @@ Start-Process -FilePath $exePath
         if not hasattr(self, "subtitle_overlay"):
             return
         has_any = bool(self.subtitle_primary_cues or self.subtitle_secondary_cues)
+        if has_any and (self.random_art_mode or self.random_art_delay_timer.isActive()
+                        or self.random_art_delay_paused or self.random_art_timer_paused):
+            self.stop_random_art_mode(hide_notice=True)
+            self.restore_original_album_art()
+        self.subtitle_overlay.set_full_area(self.is_art_only_mode and not self.is_quarter_art_mode)
         self.apply_active_subtitle_mode()
         has_srt = bool(self.subtitle_cues)
         has_current = has_srt and self.subtitle_overlay.current_index >= 0
-        should_show_panel = has_srt and not self.subtitles_manually_hidden and self.subtitle_display_mode != 0
+        should_show_panel = (has_srt and not self.subtitles_manually_hidden
+                             and self.subtitle_display_mode != 0 and not self.is_quarter_art_mode)
         control_state = (has_any, has_srt, has_current, should_show_panel, self.subtitle_display_mode, self.subtitles_manually_hidden)
 
         if hasattr(self, "subtitle_toggle_button"):
@@ -4530,7 +4490,7 @@ Start-Process -FilePath $exePath
         if self.subtitles_manually_hidden:
             self.subtitle_overlay.hide()
         else:
-            self.subtitle_overlay.setVisible(should_show_panel and has_current)
+            self.subtitle_overlay.setVisible(should_show_panel)
         self._last_subtitle_control_state = control_state
 
     def hide_subtitle_panel(self):
@@ -4576,13 +4536,18 @@ Start-Process -FilePath $exePath
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        if getattr(self, "_display_update_in_progress", False):
+            return
         if hasattr(self, "art_resize_timer"):
             self.art_resize_timer.start(120)
         self.update_left_panel_visibility()
         self.position_random_art_notice()
 
     def update_left_panel_visibility(self):
+        was_visible = self.left_playlist_visible
         if self.is_art_only_mode or self.is_one_shot_panel_mode:
+            if hasattr(self, "splitter_restore_timer"):
+                self.splitter_restore_timer.stop()
             self.left_panel.hide()
             if hasattr(self, "drawer_rail"):
                 self.drawer_rail.hide()
@@ -4602,7 +4567,7 @@ Start-Process -FilePath $exePath
         if hasattr(self, "drawer_button"):
             self.drawer_button.setText("‹" if should_show else "☰")
             self.drawer_button.setToolTip(T("再生リストを閉じる") if should_show else T("再生リストを開く"))
-        if should_show:
+        if should_show and not was_visible:
             self.restore_main_splitter_sizes_later()
 
     def toggle_playlist_drawer(self):
@@ -4841,8 +4806,10 @@ Start-Process -FilePath $exePath
             self.set_one_shot_mode(False)
             return
         if self.is_art_only_mode:
-            # 通常ミニプレイヤーのダブルクリックは、元の通常Playerへ戻す。
-            self.exit_art_only_mode()
+            if self.is_quarter_art_mode:
+                self.exit_art_only_mode()
+            else:
+                self.enter_quarter_art_mode()
         else:
             self.enter_art_only_mode()
 
@@ -4895,108 +4862,153 @@ Start-Process -FilePath $exePath
         self.small_next_button.setVisible(show_next)
         self.update_small_time_label()
 
+    @contextmanager
+    def display_update_batch(self):
+        """Apply one display transition and paint/save only the final layout."""
+        was_updating = self.updatesEnabled()
+        self._display_update_in_progress = True
+        self.setUpdatesEnabled(False)
+        try:
+            yield
+        finally:
+            self._display_update_in_progress = False
+            self.setUpdatesEnabled(was_updating)
+            self.update_left_panel_visibility()
+            self.position_random_art_notice()
+            self.art_resize_timer.start(0)
+            self.update_subtitle_controls()
+            self.request_save_settings(750)
+
+    def track_has_lyrics(self):
+        return bool(self.subtitle_primary_cues or self.subtitle_secondary_cues)
+
+    def save_art_only_geometry(self):
+        if self.is_quarter_art_mode:
+            self.settings.setValue("quarter_art_geometry", self.geometry())
+            if self.art_only_geometry_before_quarter is not None:
+                geometry = QRect(self.art_only_geometry_before_quarter)
+                geometry.moveTopLeft(self.pos())
+                self.settings.setValue("art_only_geometry", geometry)
+        else:
+            self.settings.setValue("art_only_geometry", self.geometry())
+
+    def enter_quarter_art_mode(self):
+        if not self.is_art_only_mode or self.is_quarter_art_mode:
+            return
+        with self.display_update_batch():
+            self.art_only_geometry_before_quarter = QRect(self.geometry())
+            self.save_art_only_geometry()
+            self.is_quarter_art_mode = True
+            self.hide_small_controls()
+            self.art_title_label.show()
+            self.small_control_layout.setContentsMargins(0, 0, 0, 0)
+            # 128x128 album art (one quarter of 256x256) plus the 26px title.
+            self.setFixedSize(128, 154)
+            self.subtitle_overlay.hide()
+            app_log("Enter quarter album-art mode")
+
     def enter_art_only_mode(self):
         if self.is_art_only_mode or self.is_one_shot_panel_mode:
             return
-        app_log("Enter art-only mode")
-        self.normal_geometry_before_small_mode = self.geometry()
-        self.hide_normal_controls()
-        self.hide_one_shot_controls()
-        self.show_small_controls(show_next=True)
-        self.root_layout.setContentsMargins(0, 0, 0, 0)
-        self.root_layout.setSpacing(0)
-        self.art_stack.setStyleSheet("QFrame{background:#000;border-radius:0px;}")
-        self.art_label.setStyleSheet("QLabel{background:#000;border-radius:0px;color:#888;font-size:13px;}")
-        self.is_art_only_mode = True
-        saved_geo = self.settings.value("art_only_geometry")
-        self.hide()
-        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
-        self.setFixedSize(256, 326)
-        if saved_geo:
-            self.setGeometry(saved_geo)
+        with self.display_update_batch():
+            app_log("Enter art-only mode")
+            self.normal_geometry_before_small_mode = self.geometry()
+            self.is_art_only_mode = True
+            self.is_quarter_art_mode = False
+            self.small_control_layout.setContentsMargins(0, 0, 8, 8)
+            self.hide_normal_controls()
+            self.hide_one_shot_controls()
+            self.show_small_controls(show_next=True)
+            self.root_layout.setContentsMargins(0, 0, 0, 0)
+            self.root_layout.setSpacing(0)
+            self.art_stack.setStyleSheet("QFrame{background:#000;border-radius:0px;}")
+            self.art_label.setStyleSheet("QLabel{background:#000;border-radius:0px;color:#888;font-size:13px;}")
+            saved_geo = self.settings.value("art_only_geometry")
+            self.hide()
+            self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
             self.setFixedSize(256, 326)
-        else:
-            self.move(self.normal_geometry_before_small_mode.topLeft())
-        self.show()
-        self.set_art_pixmap()
-        self.save_settings()
+            if saved_geo:
+                self.setGeometry(saved_geo)
+                self.setFixedSize(256, 326)
+            else:
+                self.move(self.normal_geometry_before_small_mode.topLeft())
+            self.show()
 
     def exit_art_only_mode(self):
         if not self.is_art_only_mode:
             return
-        app_log("Exit art-only mode")
-        self.settings.setValue("art_only_geometry", self.geometry())
-        self.is_art_only_mode = False
-        self.hide_small_controls()
-        self.show_normal_controls()
-        self.root_layout.setContentsMargins(10, 8, 10, 8)
-        self.root_layout.setSpacing(8)
-        self.art_stack.setStyleSheet("QFrame{background:#202020;border-radius:12px;}")
-        self.art_label.setStyleSheet("QLabel{background:#202020;border-radius:12px;color:#888;font-size:13px;}")
-        self.hide()
-        self.setWindowFlags(Qt.Window)
-        self.setMinimumSize(280, 260)
-        self.setMaximumSize(16777215, 16777215)
-        if self.normal_geometry_before_small_mode:
-            self.setGeometry(self.normal_geometry_before_small_mode)
-        else:
-            self.resize(720, 520)
-        self.show()
-        self.set_art_pixmap()
-        self.save_settings()
+        with self.display_update_batch():
+            app_log("Exit art-only mode")
+            self.save_art_only_geometry()
+            self.is_art_only_mode = False
+            self.is_quarter_art_mode = False
+            self.small_control_layout.setContentsMargins(0, 0, 8, 8)
+            self.hide_small_controls()
+            self.show_normal_controls()
+            self.root_layout.setContentsMargins(10, 8, 10, 8)
+            self.root_layout.setSpacing(8)
+            self.art_stack.setStyleSheet("QFrame{background:#202020;border-radius:12px;}")
+            self.art_label.setStyleSheet("QLabel{background:#202020;border-radius:12px;color:#888;font-size:13px;}")
+            self.hide()
+            self.setWindowFlags(Qt.Window)
+            self.setMinimumSize(280, 260)
+            self.setMaximumSize(16777215, 16777215)
+            if self.normal_geometry_before_small_mode:
+                self.setGeometry(self.normal_geometry_before_small_mode)
+            else:
+                self.resize(720, 520)
+            self.show()
 
     def enter_one_shot_panel_mode(self):
         if self.is_one_shot_panel_mode:
             return
         if self.is_art_only_mode:
             self.exit_art_only_mode()
-        app_log("Enter one-shot panel mode")
-        self.normal_geometry_before_small_mode = self.geometry()
-        self.hide_normal_controls()
-        self.show_one_shot_controls()
-        self.show_small_controls(show_next=False)
-        self.root_layout.setContentsMargins(0, 0, 0, 0)
-        self.root_layout.setSpacing(0)
-        self.art_stack.setStyleSheet("QFrame{background:#000;border-radius:0px;}")
-        self.art_label.setStyleSheet("QLabel{background:#000;border-radius:0px;color:#888;font-size:13px;}")
-        self.is_one_shot_panel_mode = True
-        saved_geo = self.settings.value("one_shot_geometry")
-        self.hide()
-        self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
-        self.setFixedSize(256, 350)
-        if saved_geo:
-            self.setGeometry(saved_geo)
+        with self.display_update_batch():
+            app_log("Enter one-shot panel mode")
+            self.normal_geometry_before_small_mode = self.geometry()
+            self.is_one_shot_panel_mode = True
+            self.hide_normal_controls()
+            self.show_one_shot_controls()
+            self.show_small_controls(show_next=False)
+            self.root_layout.setContentsMargins(0, 0, 0, 0)
+            self.root_layout.setSpacing(0)
+            self.art_stack.setStyleSheet("QFrame{background:#000;border-radius:0px;}")
+            self.art_label.setStyleSheet("QLabel{background:#000;border-radius:0px;color:#888;font-size:13px;}")
+            saved_geo = self.settings.value("one_shot_geometry")
+            self.hide()
+            self.setWindowFlags(Qt.Window | Qt.FramelessWindowHint)
             self.setFixedSize(256, 350)
-        else:
-            self.move(self.normal_geometry_before_small_mode.topLeft())
-        self.show()
-        self.set_art_pixmap()
-        self.save_settings()
+            if saved_geo:
+                self.setGeometry(saved_geo)
+                self.setFixedSize(256, 350)
+            else:
+                self.move(self.normal_geometry_before_small_mode.topLeft())
+            self.show()
 
     def exit_one_shot_panel_mode(self):
         if not self.is_one_shot_panel_mode:
             return
-        app_log("Exit one-shot panel mode")
-        self.settings.setValue("one_shot_geometry", self.geometry())
-        self.is_one_shot_panel_mode = False
-        self.hide_one_shot_controls()
-        self.hide_small_controls()
-        self.show_normal_controls()
-        self.root_layout.setContentsMargins(10, 8, 10, 8)
-        self.root_layout.setSpacing(8)
-        self.art_stack.setStyleSheet("QFrame{background:#202020;border-radius:12px;}")
-        self.art_label.setStyleSheet("QLabel{background:#202020;border-radius:12px;color:#888;font-size:13px;}")
-        self.hide()
-        self.setWindowFlags(Qt.Window)
-        self.setMinimumSize(280, 260)
-        self.setMaximumSize(16777215, 16777215)
-        if self.normal_geometry_before_small_mode:
-            self.setGeometry(self.normal_geometry_before_small_mode)
-        else:
-            self.resize(720, 520)
-        self.show()
-        self.set_art_pixmap()
-        self.save_settings()
+        with self.display_update_batch():
+            app_log("Exit one-shot panel mode")
+            self.settings.setValue("one_shot_geometry", self.geometry())
+            self.is_one_shot_panel_mode = False
+            self.hide_one_shot_controls()
+            self.hide_small_controls()
+            self.show_normal_controls()
+            self.root_layout.setContentsMargins(10, 8, 10, 8)
+            self.root_layout.setSpacing(8)
+            self.art_stack.setStyleSheet("QFrame{background:#202020;border-radius:12px;}")
+            self.art_label.setStyleSheet("QLabel{background:#202020;border-radius:12px;color:#888;font-size:13px;}")
+            self.hide()
+            self.setWindowFlags(Qt.Window)
+            self.setMinimumSize(280, 260)
+            self.setMaximumSize(16777215, 16777215)
+            if self.normal_geometry_before_small_mode:
+                self.setGeometry(self.normal_geometry_before_small_mode)
+            else:
+                self.resize(720, 520)
+            self.show()
 
     def playlist_toolbar_button_style(self, active: bool = False, repeat_mode: str = "") -> str:
         border_color = "#66a8ff" if active else "#555"
@@ -6876,8 +6888,7 @@ Start-Process -FilePath $exePath
     def exit_application(self):
         app_log("Exit selected")
         self.exit_requested = True
-        if self.media_preload_cancel_event is not None:
-            self.media_preload_cancel_event.set()
+        self.player.shutdown()
         self.shutdown_remote_control()
         self.save_settings()
         if self.tray_icon is not None:
@@ -6972,7 +6983,7 @@ Start-Process -FilePath $exePath
         if self.is_art_only_mode:
             if self.normal_geometry_before_small_mode:
                 self.settings.setValue("geometry", self.normal_geometry_before_small_mode)
-            self.settings.setValue("art_only_geometry", self.geometry())
+            self.save_art_only_geometry()
         elif self.is_one_shot_panel_mode:
             if self.normal_geometry_before_small_mode:
                 self.settings.setValue("geometry", self.normal_geometry_before_small_mode)
@@ -7024,27 +7035,24 @@ Start-Process -FilePath $exePath
                 app_log(f"[SETTINGS] splitter save failed: {e}")
 
     def restore_main_splitter_sizes_later(self):
-        def restore():
-            try:
-                if not hasattr(self, "main_splitter"):
-                    return
-                raw = self.settings.value("main_splitter_sizes_json", "")
-                if not raw:
-                    return
-                sizes = json.loads(raw)
-                if isinstance(sizes, list) and len(sizes) == 2:
-                    left = max(120, int(sizes[0]))
-                    right = max(128, int(sizes[1]))
-                    if left > 0 and right > 0:
-                        self.main_splitter.setSizes([left, right])
-                        app_log(f"Restored splitter sizes: left={left}, art={right}")
-            except Exception as e:
-                app_log(f"[SETTINGS] splitter restore failed: {e}")
+        # Coalesce layout requests; resizing an already open drawer needs no restore.
+        self.splitter_restore_timer.start(150)
 
-        # ドロワー表示直後・レイアウト確定後の両方で復元する。
-        QTimer.singleShot(0, restore)
-        QTimer.singleShot(150, restore)
-        QTimer.singleShot(500, restore)
+    def restore_main_splitter_sizes(self):
+        if (self.is_art_only_mode or self.is_one_shot_panel_mode
+                or not self.drawer_open or not self.left_panel.isVisible()):
+            return
+        try:
+            raw = self.settings.value("main_splitter_sizes_json", "")
+            if not raw:
+                return
+            sizes = json.loads(raw)
+            if isinstance(sizes, list) and len(sizes) == 2:
+                left = max(120, int(sizes[0]))
+                right = max(128, int(sizes[1]))
+                self.main_splitter.setSizes([left, right])
+        except Exception as exc:
+            app_log(f"[SETTINGS] splitter restore failed: {exc}")
 
     def load_settings(self):
         perf_start = time.perf_counter()
@@ -7233,6 +7241,8 @@ Start-Process -FilePath $exePath
             "path": str(current or ""),
             "position_ms": int(self.player.position() or 0),
             "duration_ms": int(self.player.duration() or 0),
+            "audio_worker_pid": self.player.worker_pid,
+            "audio_engine": self.player.engine,
             "volume": float(self.audio.volume()),
             "remote_url": getattr(getattr(self, "remote_server", None), "url", ""),
         }
@@ -7332,8 +7342,7 @@ Start-Process -FilePath $exePath
             return
 
         app_log("Application closing by explicit exit")
-        if self.media_preload_cancel_event is not None:
-            self.media_preload_cancel_event.set()
+        self.player.shutdown()
         self.shutdown_remote_control()
         self.save_settings()
         try:
@@ -7353,6 +7362,9 @@ Start-Process -FilePath $exePath
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--audio-worker":
+        from audio_worker import run_audio_worker
+        sys.exit(run_audio_worker(sys.argv[2]))
     configure_windows_playback_priority()
     startup_audio_files = collect_startup_audio_files(sys.argv[1:])
     if startup_audio_files and try_forward_one_shot_to_existing_instance(startup_audio_files):

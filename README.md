@@ -75,7 +75,7 @@ python .\dropMP3.py
 1. 音楽ファイル、フォルダ、またはプレイリストファイルをウィンドウへドロップします。
 2. ドロップした曲がそのまま再生され、プレイリストに追加されます。
 3. 左ドロワーから並び替え、複数選択、削除、保存を行えます。
-4. ジャケット画像のダブルクリックでミニプレイヤー表示へ切り替えできます。
+4. ジャケット画像のダブルクリックで「通常 → 縮小 → 1/4アルバム画像＋タイトル → 通常」の順に表示を切り替えます。
 5. 字幕ファイルが見つかれば再生時間に合わせて表示されます。
 
 ### 字幕まわり
@@ -209,8 +209,8 @@ python .\dropMP3.py
 1. Drop audio files, folders, or playlist files onto the window.
 2. The dropped track starts playing immediately and is added to the playlist.
 3. Use the left drawer to reorder, multi-select, delete, and save playlist items.
-4. Double-click the jacket image to switch to mini player mode.
-5. If subtitle files are found, they are displayed in sync with playback.
+4. Double-click the jacket image to cycle through normal, mini, quarter-area album art with title, and normal views.
+5. If subtitle files are found, they are displayed in sync with playback. Lyrics use the full image area in mini view and are hidden in quarter view. Songs with lyrics keep their own album art and suspend random images.
 
 ### Subtitle Handling
 

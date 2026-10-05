@@ -90,6 +90,7 @@ python -m PyInstaller `
     --splash "$SplashPng" `
     --collect-all PySide6 `
     --collect-all mutagen `
+    --collect-all winrt `
     --hidden-import PySide6.QtMultimedia `
     --hidden-import PySide6.QtMultimediaWidgets `
     --hidden-import PySide6.QtNetwork `
