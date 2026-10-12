@@ -100,12 +100,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
 
 from mutagen import File as MutagenFile
-from audio_process import AudioProcessPlayer
+from video_support import MediaProcessPlayer, VideoThumbnail, VIDEO_EXTS
+from header_controls import HeaderButton, VideoButton
 
 
 AUDIO_EXTS = {
     ".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".aiff", ".aif"
-}
+} | VIDEO_EXTS
 
 PLAYLIST_EXTS = {".m3u", ".m3u8", ".wpl", ".pls"}
 TEXT_PLAYLIST_EXTS = {".txt", ".list", ".playlist"}
@@ -114,7 +115,7 @@ LIST_FILE_EXTS = PLAYLIST_EXTS | TEXT_PLAYLIST_EXTS
 APP_START_MONO = time.perf_counter()
 APP_NAME = "DropMP3"
 APP_GITHUB_REPO = "cyfomix-ui/dropMP3"
-APP_VERSION_FALLBACK = "1.18"
+APP_VERSION_FALLBACK = "1.22"
 APP_VERSION_FILE = "_conf/app_version.xml"
 APP_VERSION_LEGACY_FILE = "_conf/app_version.json"
 APP_UPDATE_API_URL = f"https://api.github.com/repos/{APP_GITHUB_REPO}/releases/latest"
@@ -356,6 +357,8 @@ else:
     APP_UI_LANGUAGE = "ja" if _detect_japanese_ui_language() else "en"
 
 _UI_TRANSLATIONS_EN = {
+    "動画": "Video",
+    "ON: 映像と音声を再生 / OFF: 音声と代表画像を表示": "ON: Play video and audio / OFF: Play audio with a still image",
     '\n\n失敗:\n': '\n\nFailed:\n',
     '\nSRT文字コード正規化に失敗: ': '\nFailed to normalize SRT text encoding: ',
     '\n[警告] 幻聴字幕の可能性あり。検出例:': '\n[Warning] Possible hallucinated subtitles. Examples:',
@@ -380,6 +383,7 @@ _UI_TRANSLATIONS_EN = {
     'M3U8リストファイルの保存に失敗しました。\n\n': 'Failed to save the M3U8 playlist file.\n\n',
     'M3U8リストファイルを作成': 'Create M3U8 playlist file',
     'PATH上の whisper.exe / whisper.cmd、または python -m whisper を確認してください。': 'Check whisper.exe / whisper.cmd on PATH, or python -m whisper.',
+    'GPUでの字幕作成に失敗したため、CPUで一度だけ再実行します。mediumモデルのCPU処理には時間がかかります。': 'Subtitle generation failed on the GPU. Retrying once on the CPU. The medium model can take a long time on the CPU.',
     'SRTをメモ帳で開く': 'Open SRT in Notepad',
     'SRTファイルが見つかりません。Whisperのログを確認してください。': 'SRT file was not found. Check the Whisper log.',
     'SRTファイルはまだ作成されていません。\n\n': 'SRT file has not been created yet.\n\n',
@@ -2122,6 +2126,9 @@ class MiniDropPlayer(QWidget):
                 "en": self.conf_html_dir / "DropMp3_Install_Help_en.html",
             },
         }
+        self._restoring_session = True
+        self._session_closing = False
+        self.pending_restore_state = None
         self.settings = QSettings(str(self.conf_dir / "DropMp3.ini"), QSettings.Format.IniFormat)
         self.current_app_version = read_app_version(self.app_base_dir())
         self.update_bridge = UpdateWorkerBridge(self)
@@ -2205,6 +2212,9 @@ class MiniDropPlayer(QWidget):
         self.settings_save_timer = QTimer(self)
         self.settings_save_timer.setSingleShot(True)
         self.settings_save_timer.timeout.connect(self.save_settings)
+        self.session_save_timer = QTimer(self)
+        self.session_save_timer.setSingleShot(True)
+        self.session_save_timer.timeout.connect(self.save_session_checkpoint)
         self.art_resize_timer = QTimer(self)
         self.art_resize_timer.setSingleShot(True)
         self.art_resize_timer.timeout.connect(self.set_art_pixmap)
@@ -2230,8 +2240,13 @@ class MiniDropPlayer(QWidget):
         self.current_title_color = "#ffffff"
 
         self.update_startup_splash("メインウィンドウを準備中...", 22)
-        self.player = AudioProcessPlayer(self, app_log)
+        self.player = MediaProcessPlayer(self, app_log)
+        self.video_thumbnail = VideoThumbnail(self)
+        self.video_thumbnail.ready.connect(self.on_video_thumbnail)
+        self.player.videoFrameChanged.connect(self.on_video_frame)
+        QApplication.instance().aboutToQuit.connect(self.prepare_session_shutdown)
         QApplication.instance().aboutToQuit.connect(self.player.shutdown)
+        QApplication.instance().aboutToQuit.connect(self.video_thumbnail.cancel)
         self.audio = QAudioOutput(self)
         self.media_devices = QMediaDevices(self)
         self.player.setAudioOutput(self.audio)
@@ -2261,6 +2276,7 @@ class MiniDropPlayer(QWidget):
         self.setup_tray_icon()
         self.update_startup_splash("設定とプレイリストを復元中...", 72)
         self.load_settings()
+        self._restoring_session = False
         self.setup_remote_control()
         QTimer.singleShot(1800, self.schedule_startup_update_check)
 
@@ -2273,6 +2289,7 @@ class MiniDropPlayer(QWidget):
     def set_media_source(self, path: Path, *, autoplay: bool) -> None:
         """Start from the file immediately; never wait for whole-track preloading."""
         self.player.stop()
+        self.video_button.setEnabled(Path(path).suffix.lower() in VIDEO_EXTS)
         self.player.setSource(QUrl.fromLocalFile(str(Path(path))))
         app_log(f"[AUDIO] Direct file playback: {path}")
         if autoplay:
@@ -2639,11 +2656,19 @@ class MiniDropPlayer(QWidget):
         self.apply_title_label_style()
         self.title_label.setTextColor("#ffffff")
 
-        self.random_check = QPushButton("🎨")
+        self.random_check = HeaderButton("🎨")
         self.random_check.setCheckable(True)
         self.random_check.setChecked(True)
         self.random_check.setToolTip(T("ランダム画像表示 ON/OFF\nON: 曲の最初は元画像を表示し、約20秒後からプレイリスト内の画像をランダム表示します\nOFF: 現在の曲に埋め込まれた元画像へ戻します"))
         self.random_check.setFixedSize(42, 42)
+
+        self.video_button = VideoButton()
+        self.video_button.setAccessibleName(T("動画"))
+        self.video_button.setCheckable(True)
+        self.video_button.setEnabled(False)
+        self.video_button.setFixedSize(48, 42)
+        self.video_button.setToolTip(T("ON: 映像と音声を再生 / OFF: 音声と代表画像を表示"))
+        self.video_button.toggled.connect(self.on_video_toggled)
 
         self.header_widget = QWidget()
         self.header_widget.setFixedHeight(48)
@@ -2651,7 +2676,7 @@ class MiniDropPlayer(QWidget):
         header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(8)
 
-        self.load_playlist_button = QPushButton("📋")
+        self.load_playlist_button = HeaderButton("📋")
         self.load_playlist_button.setToolTip(T("保存済みリストを開く"))
         self.load_playlist_button.setFixedSize(42, 42)
         self.load_playlist_button.setStyleSheet("""
@@ -2661,7 +2686,7 @@ class MiniDropPlayer(QWidget):
             }
             QPushButton:hover { background-color:#1d3828; border-color:#41db78; color:#ffffff; }
         """)
-        self.clear_playlist_button = QPushButton("🧹")
+        self.clear_playlist_button = HeaderButton("🧹")
         self.clear_playlist_button.setToolTip(T("再生リストをクリア"))
         self.clear_playlist_button.setFixedSize(42, 42)
         self.clear_playlist_button.setStyleSheet("""
@@ -2671,7 +2696,7 @@ class MiniDropPlayer(QWidget):
             }
             QPushButton:hover { background-color:#3a3020; border-color:#ff9b45; color:#ffb36a; }
         """)
-        self.save_playlist_button = QPushButton("💾")
+        self.save_playlist_button = HeaderButton("💾")
         self.save_playlist_button.setToolTip(T("再生リストを保存"))
         self.save_playlist_button.setFixedSize(42, 42)
         self.save_playlist_button.setStyleSheet("""
@@ -2681,7 +2706,7 @@ class MiniDropPlayer(QWidget):
             }
             QPushButton:hover { background-color:#253245; border-color:#66a8ff; color:#ffffff; }
         """)
-        self.new_playlist_button = QPushButton("+")
+        self.new_playlist_button = HeaderButton("+")
         self.new_playlist_button.setToolTip(T("新しい再生リストを作成"))
         self.new_playlist_button.setFixedSize(42, 42)
         self.new_playlist_button.setStyleSheet("""
@@ -2692,7 +2717,7 @@ class MiniDropPlayer(QWidget):
             }
             QPushButton:hover { background-color:#253245; border-color:#66a8ff; color:#ffffff; }
         """)
-        self.subtitle_toggle_button = QPushButton("💬")
+        self.subtitle_toggle_button = HeaderButton("💬")
         self.subtitle_toggle_button.setToolTip(T("字幕表示を切り替えます"))
         self.subtitle_toggle_button.setFixedSize(42, 42)
         self.subtitle_toggle_button.setCheckable(True)
@@ -2704,8 +2729,16 @@ class MiniDropPlayer(QWidget):
         header_layout.addSpacing(4)
         header_layout.addWidget(self.title_label, stretch=1)
         header_layout.addWidget(self.subtitle_toggle_button, alignment=Qt.AlignRight | Qt.AlignVCenter)
+        header_layout.addWidget(self.video_button, alignment=Qt.AlignRight | Qt.AlignVCenter)
         header_layout.addWidget(self.random_check, alignment=Qt.AlignRight | Qt.AlignVCenter)
+        self.header_buttons = (
+            self.load_playlist_button, self.clear_playlist_button,
+            self.save_playlist_button, self.new_playlist_button,
+            self.subtitle_toggle_button, self.video_button, self.random_check,
+        )
+        self.title_label.setMinimumWidth(0)
         self.update_random_art_button_style()
+        self.update_header_scale()
 
         self.one_shot_header_label = QLabel("OneShot")
         self.one_shot_header_label.setAlignment(Qt.AlignCenter)
@@ -3400,7 +3433,7 @@ class MiniDropPlayer(QWidget):
         self.update_left_panel_visibility()
         self.save_settings()
 
-    def play_one_shot(self, path: Path, enter_panel: bool = True):
+    def play_one_shot(self, path: Path, enter_panel: bool = True, *, autoplay=True, restore_position=0):
         current_normal_path = None
         if 0 <= self.current_index < len(self.playlist):
             current_normal_path = self.playlist[self.current_index]
@@ -3414,9 +3447,9 @@ class MiniDropPlayer(QWidget):
         if enter_panel and not self.is_one_shot_panel_mode:
             self.enter_one_shot_panel_mode()
         app_log(f"One-shot play: {path}")
-        self.pending_restore_position = 0
+        self.pending_restore_position = max(0, int(restore_position))
         self.restored_once = False
-        self.set_media_source(path, autoplay=True)
+        self.set_media_source(path, autoplay=autoplay)
         title = self.get_display_title(path)
         self.one_shot_name_label.setText(title)
         self.art_title_label.setText(title)
@@ -3542,6 +3575,7 @@ class MiniDropPlayer(QWidget):
             # 一時停止・停止中はランダム画像の自動切替も止める。
             self.pause_random_art_timers_for_playback_pause()
         self.update_tray_play_pause_button()
+        self.save_session_checkpoint()
 
     def update_tray_play_pause_button(self):
         button = getattr(self, "tray_play_pause_button", None)
@@ -3558,13 +3592,22 @@ class MiniDropPlayer(QWidget):
         self.position_slider.setRange(0, max(0, duration))
         self.total_time_label.setText(format_ms(duration))
         self.update_small_time_label(self.player.position(), duration)
-        if duration > 0 and self.pending_restore_position > 0 and not self.restored_once:
-            pos = min(self.pending_restore_position, max(0, duration - 1000))
-            app_log(f"Restore playback position: {format_ms(pos)} ({pos} ms)")
-            QTimer.singleShot(200, lambda: self.player.setPosition(pos))
+        if duration > 0 and not self.restored_once:
+            pos = min(max(0, self.pending_restore_position), duration)
             self.restored_once = True
+            state = self.pending_restore_state
+            self.pending_restore_state = None
+            if state == "stopped":
+                self.player.stop()
+            if pos:
+                self.player.setPosition(pos)
+            self.pending_restore_position = 0
+            self.save_session_checkpoint()
 
     def on_position_changed(self, position):
+        # Throttle progress writes without postponing them for every audio tick.
+        if not self.session_save_timer.isActive():
+            self.session_save_timer.start(1000)
         self.current_time_label.setText(format_ms(position))
         self.update_small_time_label(position, self.player.duration())
         self.subtitle_overlay.update_position(position)
@@ -3674,7 +3717,8 @@ class MiniDropPlayer(QWidget):
         """)
         self.stop_random_art_mode(hide_notice=True)
         self.update_random_art_pool()
-        if not self.random_art_enabled or self.track_has_lyrics():
+        if (not self.random_art_enabled or self.track_has_lyrics()
+                or (self.current_media_path() and self.current_media_path().suffix.lower() in VIDEO_EXTS)):
             return
         if not self.random_art_paths:
             return
@@ -3686,7 +3730,8 @@ class MiniDropPlayer(QWidget):
             self.start_random_art_mode()
 
     def start_random_art_mode(self):
-        if not self.random_art_enabled or self.track_has_lyrics():
+        if (not self.random_art_enabled or self.track_has_lyrics()
+                or (self.current_media_path() and self.current_media_path().suffix.lower() in VIDEO_EXTS)):
             self.stop_random_art_mode(hide_notice=True)
             self.restore_original_album_art()
             return
@@ -3702,7 +3747,8 @@ class MiniDropPlayer(QWidget):
             self.random_art_timer.start(20000)
 
     def show_random_playlist_art(self):
-        if not self.random_art_enabled or self.track_has_lyrics():
+        if (not self.random_art_enabled or self.track_has_lyrics()
+                or (self.current_media_path() and self.current_media_path().suffix.lower() in VIDEO_EXTS)):
             self.stop_random_art_mode(hide_notice=True)
             self.restore_original_album_art()
             return
@@ -3808,10 +3854,39 @@ class MiniDropPlayer(QWidget):
             self.start_random_art_mode()
         self.save_settings()
 
+    def on_video_toggled(self, checked):
+        self.stop_random_art_mode(hide_notice=True)
+        self.player.setVideoEnabled(checked)
+        if not self.player.showing_video:
+            path = self.current_media_path()
+            if path:
+                self.load_album_art(path)
+
+        self.save_settings()
+
+    def on_video_frame(self, image):
+        if self.player.showing_video:
+            self.art_source_pixmap = QPixmap.fromImage(image)
+            self.art_label.setText("")
+            self.set_art_pixmap()
+
+    def on_video_thumbnail(self, path, image):
+        if self.current_media_path() != path:
+            return
+        self.original_art_pixmap = QPixmap.fromImage(image)
+        if not self.player.showing_video:
+            self.stop_random_art_mode(hide_notice=True)
+            self.art_source_pixmap = self.original_art_pixmap
+            self.art_label.setText("")
+            self.set_art_pixmap()
+
     def load_album_art(self, path: Path):
         perf_start = time.perf_counter()
+        self.video_thumbnail.cancel()
         image_data = self.extract_album_art(path)
         if not image_data:
+            if path.suffix.lower() in VIDEO_EXTS:
+                self.video_thumbnail.load(path)
             self.original_art_pixmap = QPixmap()
             self.art_source_pixmap = QPixmap()
             self.art_label.setPixmap(QPixmap())
@@ -4534,14 +4609,35 @@ Start-Process -FilePath $exePath
         self.subtitle_overlay.update_position(self.player.position())
         self.update_subtitle_controls()
 
+    def update_header_scale(self):
+        if not hasattr(self, "header_buttons"):
+            return
+        # 720px is the normal player width; bound the range for legibility.
+        size = max(26, min(64, round(42 * self.width() / 720)))
+        if getattr(self, "_header_button_size", None) == size:
+            return
+        self._header_button_size = size
+        for button in self.header_buttons:
+            button.setHeaderSize(size)
+        self.header_widget.setFixedHeight(size + 6)
+        self.apply_title_label_style()
+        self.header_widget.layout().setSpacing(max(2, round(8 * size / 42)))
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        self.update_header_scale()
         if getattr(self, "_display_update_in_progress", False):
             return
         if hasattr(self, "art_resize_timer"):
             self.art_resize_timer.start(120)
         self.update_left_panel_visibility()
         self.position_random_art_notice()
+        self.request_save_settings()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if hasattr(self, "settings_save_timer"):
+            self.request_save_settings()
 
     def update_left_panel_visibility(self):
         was_visible = self.left_playlist_visible
@@ -4593,14 +4689,19 @@ Start-Process -FilePath $exePath
     def apply_title_label_style(self):
         if not hasattr(self, "title_label"):
             return
+        size = getattr(self, "_header_button_size", 42)
+        font_size = max(12, round(self.title_font_size * size / 42))
         self.title_label.setTextColor(self.current_title_color)
         self.title_label.setStyleSheet(
             f"color: {self.current_title_color}; "
             f"font-family: {self.title_font_families}; "
-            f"font-size: {self.title_font_size}px; "
+            f"font-size: {font_size}px; "
             "font-weight: 900; letter-spacing: 0.4px;"
         )
-        self.title_label.setFixedHeight(max(44, int(self.title_font_size * 1.55)))
+        title_height = max(size + 2, round(font_size * 1.55))
+        self.title_label.setFixedHeight(title_height)
+        if hasattr(self, "header_widget"):
+            self.header_widget.setFixedHeight(max(size + 6, title_height + 4))
 
     def apply_left_panel_style(self):
         if not hasattr(self, "left_panel"):
@@ -6647,6 +6748,7 @@ Start-Process -FilePath $exePath
         env.insert("PYTHONUTF8", "1")
         env.insert("PYTHONIOENCODING", "utf-8")
         proc.setProcessEnvironment(env)
+        retry_state = {"cpu": False, "cancelled": False, "gpu_error": False, "tail": ""}
 
         def decode_process_data(data) -> str:
             raw = bytes(data)
@@ -6669,6 +6771,18 @@ Start-Process -FilePath $exePath
         def append_output():
             data = decode_process_data(proc.readAllStandardOutput())
             if data:
+                # Retain a small overlap: QProcess can split an error across reads.
+                scan = (retry_state["tail"] + data).lower()
+                if any(marker in scan for marker in (
+                    "no kernel image is available",
+                    "not compatible with the current pytorch installation",
+                    "cuda error:",
+                    "cuda out of memory",
+                    "torch.outofmemoryerror",
+                    "cublas_status_alloc_failed",
+                )):
+                    retry_state["gpu_error"] = True
+                retry_state["tail"] = scan[-512:]
                 log_edit.moveCursor(QTextCursor.MoveOperation.End)
                 log_edit.insertPlainText(data)
                 log_edit.moveCursor(QTextCursor.MoveOperation.End)
@@ -6677,7 +6791,7 @@ Start-Process -FilePath $exePath
                     app_log(f"[WHISPER] {line}")
 
         def started():
-            progress.setFormat(T("Whisper実行中... mediumモデルで変換中"))
+            progress.setFormat(T("Whisper実行中... mediumモデルで変換中") + (" (CPU)" if retry_state["cpu"] else ""))
             log_edit.appendPlainText(T("Whisperプロセスを起動しました。"))
             log_edit.appendPlainText(T("変換ログはここに逐次表示します。何も出ない時間があっても medium モデルのロード中/解析中の可能性があります。\n"))
             app_log("Whisper process started")
@@ -6710,8 +6824,26 @@ Start-Process -FilePath $exePath
 
         def finished(exit_code, status):
             append_output()
+            if (not retry_state["cancelled"] and not retry_state["cpu"]
+                    and retry_state["gpu_error"]
+                    and (exit_code != 0 or not expected_srt.exists())):
+                # Use a fresh process so failed CUDA state cannot leak into CPU inference.
+                retry_state["cpu"] = True
+                retry_state["gpu_error"] = False
+                retry_state["tail"] = ""
+                cpu_args = all_args + ["--device", "cpu", "--fp16", "False"]
+                message = T("GPUでの字幕作成に失敗したため、CPUで一度だけ再実行します。mediumモデルのCPU処理には時間がかかります。")
+                log_edit.appendPlainText("\n" + message)
+                log_edit.appendPlainText("Command : " + program + " " + " ".join(cpu_args))
+                app_log(message)
+                progress.setRange(0, 0)
+                cancel_button.setEnabled(True)
+                close_button.setEnabled(False)
+                proc.setArguments(cpu_args)
+                proc.start()
+                return
             progress.setRange(0, 100)
-            if exit_code == 0 and expected_srt.exists():
+            if not retry_state["cancelled"] and exit_code == 0 and expected_srt.exists():
                 text = finish_success_text()
                 build_target_subtitles()
                 if expected_srt.exists():
@@ -6798,6 +6930,7 @@ Start-Process -FilePath $exePath
                 app_log(f"SRT sanitize failed: {e}")
 
         def cancel():
+            retry_state["cancelled"] = True
             if proc.state() != QProcess.ProcessState.NotRunning:
                 app_log("Whisper cancel requested")
                 log_edit.appendPlainText(T("\n中止要求を送信しました..."))
@@ -6888,6 +7021,7 @@ Start-Process -FilePath $exePath
     def exit_application(self):
         app_log("Exit selected")
         self.exit_requested = True
+        self.prepare_session_shutdown()
         self.player.shutdown()
         self.shutdown_remote_control()
         self.save_settings()
@@ -6954,7 +7088,37 @@ Start-Process -FilePath $exePath
             self.log_window.raise_()
             self.log_window.activateWindow()
 
+    def _write_session_checkpoint(self):
+        state = self.pending_restore_state
+        if state is None:
+            intent = self.player._intent
+            state = ("playing" if intent == QMediaPlayer.PlayingState else
+                     "paused" if intent == QMediaPlayer.PausedState else "stopped")
+        position = (self.pending_restore_position if not self.restored_once
+                    else int(self.player.position() or 0))
+        self.settings.setValue("playback_state", state)
+        self.settings.setValue("position", max(0, position))
+        self.settings.setValue("one_shot_path", str(self.one_shot_path or ""))
+        self.settings.setValue("one_shot_return_position", self.one_shot_return_position)
+        self.settings.setValue("one_shot_return_was_playing", self.one_shot_return_was_playing)
+
+    def save_session_checkpoint(self):
+        if self._restoring_session or self._session_closing:
+            return
+        self._write_session_checkpoint()
+        self.settings.sync()
+
+    def prepare_session_shutdown(self):
+        if self._session_closing:
+            return
+        self.save_settings()
+        self._session_closing = True
+        self.settings_save_timer.stop()
+        self.session_save_timer.stop()
+
     def request_save_settings(self, delay_ms=500):
+        if self._restoring_session or self._session_closing:
+            return
         self.settings_dirty = True
         self.settings_save_timer.start(max(0, int(delay_ms)))
 
@@ -6963,7 +7127,7 @@ Start-Process -FilePath $exePath
             self.save_settings()
 
     def save_settings(self):
-        if self._saving_settings:
+        if self._saving_settings or self._restoring_session or self._session_closing:
             return
         perf_start = time.perf_counter()
         self._saving_settings = True
@@ -6989,14 +7153,18 @@ Start-Process -FilePath $exePath
                 self.settings.setValue("geometry", self.normal_geometry_before_small_mode)
             self.settings.setValue("one_shot_geometry", self.geometry())
         else:
-            self.settings.setValue("geometry", self.geometry())
+            self.settings.setValue("geometry", self.normalGeometry() if self.isMaximized() else self.geometry())
+        self.settings.setValue("display_mode", "quarter" if self.is_quarter_art_mode else
+                               "art" if self.is_art_only_mode else
+                               "one_shot" if self.is_one_shot_panel_mode else "normal")
+        self.settings.setValue("window_maximized", self.isMaximized())
+        self.settings.setValue("video_enabled", self.player.video_enabled)
         self.settings.setValue("log_geometry", self.log_window.geometry())
         self.settings.setValue("log_visible", self.log_window.isVisible())
         paths = [str(p) for p in self.playlist]
         self.settings.setValue("playlist_json", json.dumps(paths, ensure_ascii=False))
         self.settings.setValue("current_index", self.current_index)
-        if self.one_shot_path is None:
-            self.settings.setValue("position", int(self.player.position() or 0))
+        self._write_session_checkpoint()
         self.settings.setValue("volume", float(self.audio.volume()))
         self.settings.setValue("one_shot_mode", self.one_shot_mode)
         self.settings.setValue("repeat_mode", self.repeat_mode)
@@ -7154,12 +7322,41 @@ Start-Process -FilePath $exePath
         app_log(f"Playlist restored: {len(self.playlist)} file(s), index={index}, position={format_ms(position)}")
         self.update_startup_splash("プレイリストを表示中...", 88)
         self.update_playlist_panel()
-        if self.playlist and 0 <= index < len(self.playlist):
+        state = str(self.settings.value("playback_state", "paused"))
+        if state not in ("playing", "paused", "stopped"):
+            state = "paused"
+        self.pending_restore_state = state
+        video = bool_from_settings(self.settings.value("video_enabled", False), False)
+        self.video_button.blockSignals(True)
+        self.video_button.setChecked(video)
+        self.video_button.blockSignals(False)
+        self.player.setVideoEnabled(video)
+        one_shot = Path(str(self.settings.value("one_shot_path", "") or ""))
+        if one_shot.is_file() and one_shot.suffix.lower() in AUDIO_EXTS:
+            self.current_index = index if 0 <= index < len(self.playlist) else -1
+            self.play_one_shot(one_shot, enter_panel=False, autoplay=state == "playing",
+                               restore_position=position)
+            self.one_shot_return_position = max(0, int(self.settings.value("one_shot_return_position", 0)))
+            self.one_shot_return_was_playing = bool_from_settings(
+                self.settings.value("one_shot_return_was_playing", False), False)
+        elif self.playlist and 0 <= index < len(self.playlist):
             self.update_startup_splash("前回の曲を復元中...", 92)
-            self.play_index(index, autoplay=False, restore_position=position)
+            self.play_index(index, autoplay=state == "playing", restore_position=position)
+        else:
+            self.pending_restore_state = None
         self.update_left_panel_visibility()
-        if self.one_shot_mode:
-            QTimer.singleShot(100, self.enter_one_shot_panel_mode)
+        mode = str(self.settings.value("display_mode", "one_shot" if self.one_shot_mode else "normal"))
+        quarter_geo = self.settings.value("quarter_art_geometry")
+        if mode in ("art", "quarter"):
+            self.enter_art_only_mode()
+            if mode == "quarter":
+                self.enter_quarter_art_mode()
+                if isinstance(quarter_geo, QRect):
+                    self.move(quarter_geo.topLeft())
+        elif mode == "one_shot":
+            self.enter_one_shot_panel_mode()
+        elif bool_from_settings(self.settings.value("window_maximized", False), False):
+            self.showMaximized()
         if bool_from_settings(self.settings.value("log_visible", False), False):
             self.log_window.show()
         self.settings_dirty = False
@@ -7324,6 +7521,8 @@ Start-Process -FilePath $exePath
         T("""通常Playerの最小化ボタンが押されたら、タスクトレイへ格納する。""")
         super().changeEvent(event)
         try:
+            if event.type() == QEvent.Type.WindowStateChange:
+                self.request_save_settings()
             if event.type() == QEvent.Type.WindowStateChange and self.isMinimized():
                 if not self.is_art_only_mode and not self.is_one_shot_panel_mode:
                     app_log("Window minimize button detected: minimize to tray")
@@ -7342,6 +7541,7 @@ Start-Process -FilePath $exePath
             return
 
         app_log("Application closing by explicit exit")
+        self.prepare_session_shutdown()
         self.player.shutdown()
         self.shutdown_remote_control()
         self.save_settings()

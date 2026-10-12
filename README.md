@@ -16,7 +16,12 @@ DropMP3 は、音楽ファイルをドラッグ＆ドロップしてすぐ再生
 - 音楽ファイルやフォルダのドラッグ＆ドロップ再生
 - プレイリストの追加、並び替え、複数選択、削除
 - 埋め込みジャケット画像の表示
+- MP4 / M4V / MOV / MKV / AVI / WebM の取り込み（対応コーデックに依存）
+- 動画は音声＋代表画像で再生し、ヘッダーのカメラアイコンで映像付き再生に切替
+- 動画と同名の `.srt` / `.srt2` を画像・映像の上に重ねて表示（例: `sample.mp4` と `sample.srt`）
+- ウィンドウ幅に合わせて上部ボタン・タイトルを自動拡縮
 - ミニプレイヤー表示
+- 表示方式・ウィンドウ位置とサイズ・再生位置・再生／一時停止／停止状態を自動保存し、次回起動時に復元（再生中に終了した場合は自動再生）
 - タスクトレイ格納
 - ワンショット再生
 - SRT / SRT2 字幕表示
@@ -87,6 +92,7 @@ DropMP3 は `.srt` と `.srt2` を扱えます。字幕は主に以下の場所�
 - アプリ側の `_conf\srt`
 
 Whisper による字幕生成では、出力先として `_conf\srt` を使います。  
+GPUのCUDA互換性エラーやメモリ不足で字幕生成が失敗した場合は、同じmediumモデルでCPUへ切り替えて一度だけ再実行します。CPU処理には時間がかかる場合があります。
 日本語 / 英語の両方を出力する設定では、`.srt` と `.srt2` を使い分けます。
 
 ### ビルド
@@ -150,7 +156,12 @@ It is built with Python and PySide6 for a personal workflow where you want to pr
 - Drag-and-drop playback for audio files and folders
 - Playlist add, reorder, multi-select, and delete
 - Embedded album art display
+- MP4 / M4V / MOV / MKV / AVI / WebM import, depending on available codecs
+- Audio with a still image by default; use the video camera button to switch to video playback
+- Overlay matching `.srt` / `.srt2` subtitles on still images and video
+- Header buttons and title scale automatically with window width
 - Mini player mode
+- Restore display mode, window position/size, playback position and play/pause/stop state on startup (playing sessions resume automatically)
 - Minimize to system tray
 - One-shot playback mode
 - SRT / SRT2 subtitle display
@@ -221,6 +232,7 @@ DropMP3 supports both `.srt` and `.srt2` subtitle files. It mainly searches in:
 - the app-side `_conf\srt` folder
 
 When generating subtitles through Whisper, output files are written to `_conf\srt`.  
+If generation fails because of CUDA compatibility errors or GPU memory exhaustion, it retries once on the CPU using the same medium model. CPU processing may take a long time.
 If both Japanese and English output are enabled, the app uses `.srt` and `.srt2` separately.
 
 ### Build
